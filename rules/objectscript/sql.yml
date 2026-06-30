@@ -1,0 +1,35 @@
+# SQL-injection-flavoured rules. Demonstrates multiple rules in one YAML file
+# via the top-level `rules:` list, using the raw `query:` form.
+rules:
+  - id: os-sql-dynamic-concat
+    name: Dynamic SQL built by string concatenation
+    message: >-
+      A SQL statement is assembled with the string-concatenation operator (_);
+      use parameterised queries (host variables / ? parameters) instead.
+    severity: error
+    languages: [objectscript]
+    cwe: CWE-89
+    references:
+      - https://docs.intersystems.com/iris/csp/docbook/DocBook.UI.Page.cls?KEY=GSQL_dynsql
+    query: |
+      ((expression
+         (expr_atom (string_literal) @sql)
+         (expr_tail (binary_operator) @op)) @match
+       (#match? @sql "(?i)\\b(select|insert|update|delete)\\b")
+       (#eq? @op "_"))
+
+  - id: os-sql-tainted-exec
+    name: Dynamic SQL executed from a variable
+    message: >-
+      A %SQL.Statement %Prepare/%ExecDirect/%Execute call receives a variable
+      argument; ensure the statement text is not built from untrusted input.
+    severity: warning
+    languages: [objectscript]
+    cwe: CWE-89
+    query: |
+      ((class_method_call
+         (class_ref (class_name (identifier) @cls))
+         (method_name (identifier_segment_immediate_special) @method)
+         (method_args (method_arg (expression (expr_atom (lvn)))))) @match
+       (#match? @cls "(?i)%?SQL\\.Statement")
+       (#match? @method "(?i)^%(ExecDirect|Prepare|Execute)$"))

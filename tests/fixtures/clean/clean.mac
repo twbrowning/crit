@@ -1,0 +1,7 @@
+Clean ; benign routine
+ set total = 0
+ for i=1:1:10 {
+     set total = total + i
+ }
+ write "Total: ", total, !
+ quit total

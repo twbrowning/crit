@@ -1,0 +1,11 @@
+Sample ; security test routine
+ ; dynamic code execution
+ set code = "set x=1"
+ xecute code
+ ; indirection
+ set field = "PERSON"
+ set @field = "value"
+ ; OS command execution
+ set rc = $ZF(-1, "/bin/sh -c whoami")
+ set out = $ZF(-100, "", "ls", "-l")
+ quit

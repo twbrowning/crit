@@ -1,0 +1,13 @@
+# Low-severity hygiene rule, authored in the structured `pattern:` format.
+# ObjectScript indirection (@) evaluates a string as a name/argument/expression;
+# it is legitimate but worth reviewing as a dynamic-evaluation sink.
+id: os-indirection-review
+name: ObjectScript indirection (@) used
+message: >-
+  Indirection (@) dynamically evaluates a string; review that the indirected
+  value is not attacker-controlled.
+severity: info
+languages: [objectscript]
+cwe: CWE-95
+pattern:
+  node: indirection

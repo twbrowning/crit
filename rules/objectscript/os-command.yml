@@ -1,0 +1,18 @@
+# OS command execution via $ZF(-1) / $ZF(-100).
+# Raw `query:` form — a tree-sitter query embedded in a structured YAML rule.
+# NOTE: when a pattern carries predicates, wrap the pattern + its predicates in
+# an outer paren so tree-sitter associates them (otherwise each `(#...)` is read
+# as a separate pattern).
+id: os-command-execution-zf
+name: OS command execution via $ZF(-1)/$ZF(-100)
+message: >-
+  $ZF(-1) and $ZF(-100) execute operating-system commands; building the command
+  from untrusted input is OS command injection.
+severity: error
+languages: [objectscript]
+cwe: CWE-78
+references:
+  - https://docs.intersystems.com/iris/csp/docbook/DocBook.UI.Page.cls?KEY=RCOS_fzf-1
+query: |
+  ((system_defined_function) @match
+   (#match? @match "(?i)^\\$zf\\s*\\(\\s*-\\s*(1|100)\\b"))

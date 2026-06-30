@@ -1,0 +1,28 @@
+# Example dynamic-language registry for catseye.
+#
+# catseye bundles the four InterSystems ObjectScript variants, but it can scan
+# *any* language whose tree-sitter grammar you compile into a shared library.
+# Point `--languages-config` at a file like this:
+#
+#   catseye --languages-config examples/languages.toml scan path/ --rules my-rules/
+#
+# Build a grammar's shared library from its generated sources, e.g.:
+#   gcc -shared -fPIC -O2 -I src -o libtree-sitter-json.so src/parser.c src/scanner.c
+#
+# Each [[language]] entry registers one grammar.
+
+[[language]]
+# Canonical id, referenced by rules via `languages: [json]`.
+id = "json"
+# Path to the compiled grammar (absolute, or relative to THIS config file).
+library = "./libtree-sitter-json.so"
+# Exported entry point. Defaults to `tree_sitter_<id>` when omitted.
+symbol = "tree_sitter_json"
+# File extensions this grammar owns (used for automatic language detection).
+extensions = ["json"]
+description = "JSON (dynamically loaded tree-sitter grammar)"
+
+# [[language]]
+# id = "python"
+# library = "/usr/local/lib/libtree-sitter-python.so"
+# extensions = ["py"]
