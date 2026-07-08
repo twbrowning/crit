@@ -301,20 +301,42 @@ pub fn engine_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Stable hash over the compiled rule set: each rule's id, severity, and query
-/// source. Prefixed `sha256:` and used both as the snapshot `ruleset_id` and as
-/// a cache-key component. Rules must be supplied in a deterministic order
-/// (crit's loader already sorts them by id).
+/// Stable hash over the rule set's *semantic* identity — everything that
+/// determines which findings exist and where they anchor: each rule's id,
+/// severity, language scoping, match capture, and query source. Prefixed
+/// `sha256:`; this is the snapshot `ruleset_id` used for baseline
+/// comparability. Rules must be supplied in a deterministic order (crit's
+/// loader already sorts them by id).
 pub fn ruleset_id(rules: &[Rule]) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(rules.len() * 3 + 1);
-    parts.push("crit.ruleset/v1".to_string());
+    let mut parts: Vec<String> = vec!["crit.ruleset/v2".to_string()];
     for r in rules {
-        parts.push(r.id.clone());
-        parts.push(r.severity.as_str().to_string());
-        parts.push(r.query_source().unwrap_or_else(|e| format!("<uncompilable:{e}>")));
+        push_semantic_identity(&mut parts, r);
     }
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
     format!("sha256:{}", fingerprint::sha256_parts(&refs))
+}
+
+/// Stable hash over the rule set's *full behavioral* identity: the semantic
+/// identity plus everything copied verbatim into findings (currently the
+/// message). This is the cache-key component — a reworded `message:` must
+/// miss the cache even though the finding set is unchanged, or warm scans
+/// serve stale text.
+pub fn ruleset_cache_id(rules: &[Rule]) -> String {
+    let mut parts: Vec<String> = vec!["crit.ruleset-cache/v1".to_string()];
+    for r in rules {
+        push_semantic_identity(&mut parts, r);
+        parts.push(r.message.clone());
+    }
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    format!("sha256:{}", fingerprint::sha256_parts(&refs))
+}
+
+fn push_semantic_identity(parts: &mut Vec<String>, r: &Rule) {
+    parts.push(r.id.clone());
+    parts.push(r.severity.as_str().to_string());
+    parts.push(r.languages.join(","));
+    parts.push(r.match_capture.clone());
+    parts.push(r.query_source().unwrap_or_else(|e| format!("<uncompilable:{e}>")));
 }
 
 /// The grammar-version map for the languages a scan actually touched.

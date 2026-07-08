@@ -10,7 +10,9 @@
 
 #![cfg(feature = "bundled-objectscript")]
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::{crit, parse_findings, rules_dir, tempdir, TempDir};
+use std::path::Path;
 use std::process::Command;
 
 const VULN_XECUTE: &str = "\
@@ -25,10 +27,6 @@ Util ; routine
  set rc = $ZF(-1, \"/bin/sh -c whoami\")
  quit
 ";
-
-fn rules_dir() -> String {
-    format!("{}/rules", env!("CARGO_MANIFEST_DIR"))
-}
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -53,19 +51,6 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn crit(repo: &Path, args: &[&str]) -> (String, String, Option<i32>) {
-    let out = Command::new(env!("CARGO_BIN_EXE_crit"))
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .expect("crit runs");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-        out.status.code(),
-    )
-}
-
 /// Build the standard two-commit fixture repo:
 /// base  = app.mac (one xecute vuln) + old-name.mac (one $ZF vuln)
 /// HEAD  = app.mac gains a second xecute vuln; old-name.mac renamed to
@@ -88,11 +73,6 @@ fn fixture_repo(tag: &str) -> (TempDir, String) {
     git(repo, &["add", "."]);
     git(repo, &["commit", "-qm", "head"]);
     (dir, base_sha)
-}
-
-fn parse_findings(json: &str) -> Vec<serde_json::Value> {
-    let doc: serde_json::Value = serde_json::from_str(json).expect("valid JSON report");
-    doc["findings"].as_array().expect("findings array").clone()
 }
 
 #[test]
@@ -372,23 +352,3 @@ fn old_scheme_baseline_is_rejected() {
     );
 }
 
-// --- tempdir helper (no external crates) ---
-
-struct TempDir(PathBuf);
-impl TempDir {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tempdir(tag: &str) -> TempDir {
-    let base = std::env::temp_dir().join(format!("crit-git-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).expect("create tempdir");
-    TempDir(base)
-}

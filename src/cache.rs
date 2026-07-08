@@ -14,10 +14,18 @@
 //!
 //! The cache is an accelerator only: corrupt, unreadable, or unwritable
 //! entries degrade to a miss/no-op and can never fail or skew a scan.
+//!
+//! **Trust boundary:** entries are plain JSON read back as findings, and keys
+//! are computable from public inputs — anyone who can write to the cache
+//! directory can hide or inject findings. The directory is created
+//! owner-only on Unix; do not point `--cache-dir` at a location writable by
+//! parties you would not let edit the scan results themselves (e.g. a
+//! shared, world-writable CI volume).
 
 use crate::finding::Finding;
 use crate::fingerprint;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default cache location, relative to the repo root (or cwd outside a repo).
 pub const DEFAULT_DIR: &str = ".crit/cache";
@@ -32,15 +40,40 @@ pub struct Cache {
 
 impl Cache {
     /// Open (creating if needed) a cache rooted at `dir`. The directory is
-    /// made self-ignoring for git via a `.gitignore` containing `*`.
+    /// made self-ignoring for git via a `.gitignore` containing `*`, and
+    /// owner-only on Unix (see the module's trust-boundary note).
     pub fn open(dir: PathBuf, ruleset_id: String) -> std::io::Result<Cache> {
-        std::fs::create_dir_all(&dir)?;
+        create_dir_private(&dir)?;
         let ignore = dir.join(".gitignore");
         if !ignore.exists() {
             // Best-effort: a cache that can't self-ignore still works.
             let _ = std::fs::write(&ignore, "*\n");
         }
         Ok(Cache { dir, ruleset_id })
+    }
+
+    /// The full opening policy in one place: `no_cache` disables, an explicit
+    /// dir wins, otherwise the default location anchored at the repo root or
+    /// the scanned tree — and any failure degrades to uncached scanning with
+    /// a warning, never to an error (the cache is an accelerator only).
+    pub fn open_default(
+        no_cache: bool,
+        explicit: Option<&Path>,
+        repo_root: Option<&Path>,
+        scan_anchor: Option<&Path>,
+        ruleset_cache_id: String,
+    ) -> Option<Cache> {
+        if no_cache {
+            return None;
+        }
+        let dir = resolve_dir(explicit, repo_root, scan_anchor);
+        match Cache::open(dir, ruleset_cache_id) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("warning: cannot open findings cache ({e}); continuing without it");
+                None
+            }
+        }
     }
 
     /// The cache key for one file. Everything the finding set depends on is
@@ -56,6 +89,12 @@ impl Cache {
         fingerprint::sha256_parts(&[
             "crit.cache/v1",
             env!("CARGO_PKG_VERSION"),
+            // The fingerprint scheme's tuning constants participate directly,
+            // so changing them invalidates entries even without a version bump.
+            &fingerprint::scheme_id(
+                fingerprint::DEFAULT_ANCESTOR_DEPTH,
+                fingerprint::CONTEXT_LINES,
+            ),
             &self.ruleset_id,
             identity_path,
             content_hash,
@@ -79,28 +118,58 @@ impl Cache {
     /// concurrent or killed scan can never leave a torn entry; failures are
     /// silently ignored (the cache is an accelerator, not a requirement).
     pub fn put(&self, key: &str, findings: &[Finding]) {
+        static WRITER: AtomicU64 = AtomicU64::new(0);
         let path = self.entry_path(key);
         let Some(parent) = path.parent() else { return };
         if std::fs::create_dir_all(parent).is_err() {
             return;
         }
         let Ok(json) = serde_json::to_string(findings) else { return };
-        let tmp = parent.join(format!(".tmp-{}-{}", std::process::id(), &key[2..10]));
+        // pid + full key + a process-wide counter: unique even if intra-
+        // process parallelism ever writes the same key twice concurrently.
+        let tmp = parent.join(format!(
+            ".tmp-{}-{}-{}",
+            std::process::id(),
+            WRITER.fetch_add(1, Ordering::Relaxed),
+            &key[2..]
+        ));
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
 }
 
-/// Resolve the effective cache directory: an explicit `--cache-dir`, else the
-/// default under the repo root (or cwd when not in a repo).
-pub fn resolve_dir(explicit: Option<&Path>, repo_root: Option<&Path>) -> PathBuf {
-    match explicit {
-        Some(d) => d.to_path_buf(),
-        None => repo_root
-            .map(|r| r.join(DEFAULT_DIR))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR)),
+/// Owner-only directory creation where the platform supports it.
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Resolve the effective cache directory: an explicit `--cache-dir`, else the
+/// default under the repo root; outside a repo, anchored at the scanned tree
+/// (never the process cwd, or caches would sprout wherever the user stands).
+fn resolve_dir(
+    explicit: Option<&Path>,
+    repo_root: Option<&Path>,
+    scan_anchor: Option<&Path>,
+) -> PathBuf {
+    if let Some(d) = explicit {
+        return d.to_path_buf();
+    }
+    if let Some(r) = repo_root {
+        return r.join(DEFAULT_DIR);
+    }
+    let anchor = scan_anchor
+        .map(|p| if p.is_dir() { p } else { p.parent().unwrap_or(Path::new(".")) })
+        .unwrap_or(Path::new("."));
+    anchor.join(DEFAULT_DIR)
 }
 
 #[cfg(test)]

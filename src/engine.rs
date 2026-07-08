@@ -20,9 +20,7 @@ struct CompiledRule {
     match_capture_ix: Option<u32>,
 }
 
-/// Number of full source lines on each side of a match folded into its
-/// `context_hash`.
-const CONTEXT_LINES: usize = 2;
+use crate::fingerprint::CONTEXT_LINES;
 
 /// Summary returned by a multi-path scan.
 #[derive(Debug, Default)]
@@ -177,33 +175,55 @@ impl<'a> Scanner<'a> {
         };
 
         // Cache lookup: a file-local finding set is a pure function of the
-        // hashed key inputs, so a hit skips parse + queries entirely.
+        // hashed key inputs, so a hit skips parse + queries entirely. The
+        // per-file bookkeeping below is shared by both paths — only
+        // `files_cached` distinguishes them.
         let id_str = fingerprint::identity_path(&id_path);
-        let cache_key = self.cache.map(|c| {
+        let cache_entry = self.cache.map(|c| {
             let content_hash = fingerprint::sha256_hex(&source);
-            c.key(&id_str, &content_hash, &entry.id, &entry.grammar_version())
+            let key = c.key(&id_str, &content_hash, &entry.id, &entry.grammar_version());
+            (c, key)
         });
-        if let (Some(cache), Some(key)) = (self.cache, cache_key.as_deref()) {
-            if let Some(cached) = cache.get(key) {
-                report.findings.extend(cached);
-                report.languages_seen.insert(entry.id.clone());
-                report.files_scanned += 1;
-                report.files_cached += 1;
-                return Ok(());
+        let cached = cache_entry.as_ref().and_then(|(c, k)| c.get(k));
+        let was_cached = cached.is_some();
+        let file_findings = match cached {
+            Some(v) => v,
+            None => {
+                let fresh = self.run_file_queries(path, &source, entry, &id_path, &id_str)?;
+                if let Some((c, k)) = &cache_entry {
+                    c.put(k, &fresh);
+                }
+                fresh
             }
+        };
+        report.findings.extend(file_findings);
+        report.languages_seen.insert(entry.id.clone());
+        report.files_scanned += 1;
+        if was_cached {
+            report.files_cached += 1;
         }
+        Ok(())
+    }
 
+    /// Parse one file and run every applicable compiled rule query over it,
+    /// returning the file's finding set (the unit the cache stores).
+    fn run_file_queries(
+        &self,
+        path: &Path,
+        source: &[u8],
+        entry: &crate::language::LanguageEntry,
+        id_path: &Path,
+        id_str: &str,
+    ) -> Result<Vec<Finding>> {
         let mut parser = Parser::new();
         parser
             .set_language(entry.language())
             .with_context(|| format!("setting language '{}'", entry.id))?;
         let tree = parser
-            .parse(&source, None)
+            .parse(source, None)
             .with_context(|| format!("parsing {}", path.display()))?;
 
         let compiled = self.compiled_for(&entry.id);
-        // Collected per file (not straight into the report) so the file's
-        // finding set can be cached as a unit.
         let mut file_findings: Vec<Finding> = Vec::new();
         let root = tree.root_node();
         let mut cursor = QueryCursor::new();
@@ -213,10 +233,10 @@ impl<'a> Scanner<'a> {
 
         for cr in compiled.iter() {
             let rule = &self.rules[cr.rule_idx];
-            let mut matches = cursor.matches(&cr.query, root, source.as_slice());
+            let mut matches = cursor.matches(&cr.query, root, source);
             while let Some(m) = matches.next() {
                 // Evaluate #eq?/#match?/#not-* text predicates.
-                let mut tp: &[u8] = source.as_slice();
+                let mut tp: &[u8] = source;
                 let sat = m.satisfies_text_predicates(&cr.query, &mut buf1, &mut buf2, &mut tp);
                 if debug {
                     let caps: Vec<String> = m
@@ -251,23 +271,23 @@ impl<'a> Scanner<'a> {
                 };
                 let start = node.start_position();
                 let end = node.end_position();
-                let snippet = source_line(&source, start.row);
+                let snippet = source_line(source, start.row);
 
                 // Stable identity: independent of absolute line numbers so a
                 // finding survives edits above it (see `crate::fingerprint`).
-                let normalized = fingerprint::normalized_match_text(&source, node);
+                let normalized = fingerprint::normalized_match_text(source, node);
                 let structural =
                     fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
                 let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
-                let fp = fingerprint::compose(&id_str, &content_key);
-                let context_hash = fingerprint::context_hash(&source, node, CONTEXT_LINES);
+                let fp = fingerprint::compose(id_str, &content_key);
+                let context_hash = fingerprint::context_hash(source, node, CONTEXT_LINES);
 
                 file_findings.push(Finding {
                     rule_id: rule.id.clone(),
                     message: rule.message.clone(),
                     severity: rule.severity,
                     language: entry.id.clone(),
-                    file: id_path.clone(),
+                    file: id_path.to_path_buf(),
                     start: Position {
                         line: start.row + 1,
                         column: start.column + 1,
@@ -287,13 +307,7 @@ impl<'a> Scanner<'a> {
                 });
             }
         }
-        if let (Some(cache), Some(key)) = (self.cache, cache_key.as_deref()) {
-            cache.put(key, &file_findings);
-        }
-        report.findings.extend(file_findings);
-        report.languages_seen.insert(entry.id.clone());
-        report.files_scanned += 1;
-        Ok(())
+        Ok(file_findings)
     }
 }
 

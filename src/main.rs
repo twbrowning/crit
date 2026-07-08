@@ -71,12 +71,10 @@ enum Command {
     DumpAst(DumpArgs),
 }
 
+/// Options shared verbatim by `scan` and `diff`. One definition: a flag added
+/// here reaches both subcommands (and the desugaring) automatically.
 #[derive(clap::Args)]
-struct ScanArgs {
-    /// Files or directories to scan.
-    #[arg(required = true, value_name = "PATH")]
-    paths: Vec<PathBuf>,
-
+struct CommonArgs {
     /// Rule files or directories (`.yml`/`.yaml`/`.scm`). Repeatable.
     #[arg(short, long, value_name = "PATH", default_value = "rules")]
     rules: Vec<PathBuf>,
@@ -92,6 +90,34 @@ struct ScanArgs {
     /// Write the report here instead of stdout.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// Always write the complete HEAD snapshot here (seeds the next baseline),
+    /// regardless of what the report includes.
+    #[arg(long, value_name = "FILE")]
+    emit_snapshot: Option<PathBuf>,
+
+    /// Findings-cache directory (content-addressed; unchanged files are not
+    /// re-parsed). Defaults to `.crit/cache` under the repo root.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Disable the findings cache entirely.
+    #[arg(long, conflicts_with = "cache_dir")]
+    no_cache: bool,
+
+    /// Print non-fatal warnings (e.g. rules skipped for a grammar) to stderr.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[derive(clap::Args)]
+struct ScanArgs {
+    /// Files or directories to scan.
+    #[arg(required = true, value_name = "PATH")]
+    paths: Vec<PathBuf>,
+
+    #[command(flatten)]
+    common: CommonArgs,
 
     /// Exit non-zero when a finding at or above this severity is present
     /// (error|warning|info|note|off).
@@ -109,11 +135,6 @@ struct ScanArgs {
     #[arg(long = "diff-mode", value_name = "MODE")]
     diff_mode: Vec<String>,
 
-    /// Always write the complete HEAD snapshot here (seeds the next baseline),
-    /// regardless of `--diff-mode`/`--format`.
-    #[arg(long, value_name = "FILE")]
-    emit_snapshot: Option<PathBuf>,
-
     /// What to do when the baseline's ruleset/engine/grammar identity differs
     /// from this scan: fail|warn|partition|rescan-base. `partition` and
     /// `rescan-base` re-derive the base finding set with the current ruleset
@@ -126,15 +147,6 @@ struct ScanArgs {
     #[arg(long)]
     fail_on_new: bool,
 
-    /// Findings-cache directory (content-addressed; unchanged files are not
-    /// re-parsed). Defaults to `.crit/cache` under the repo root.
-    #[arg(long, value_name = "DIR")]
-    cache_dir: Option<PathBuf>,
-
-    /// Disable the findings cache entirely.
-    #[arg(long, conflicts_with = "cache_dir")]
-    no_cache: bool,
-
     /// Git ref the change is against (e.g. origin/main). Enables diff
     /// attribution and rename tracking; with no `--baseline`, crit scans the
     /// base ref itself to derive one (costs one extra full scan).
@@ -146,10 +158,6 @@ struct ScanArgs {
     /// materialize the base source.
     #[arg(long, value_name = "FILE", conflicts_with = "diff_base")]
     diff: Option<String>,
-
-    /// Print non-fatal warnings (e.g. rules skipped for a grammar) to stderr.
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 #[derive(clap::Args)]
@@ -162,13 +170,8 @@ struct DiffArgs {
     #[arg(long, value_name = "REF")]
     base: String,
 
-    /// Rule files or directories. Repeatable.
-    #[arg(short, long, value_name = "PATH", default_value = "rules")]
-    rules: Vec<PathBuf>,
-
-    /// Force a language id for every input (skip extension detection).
-    #[arg(short, long, value_name = "ID")]
-    language: Option<String>,
+    #[command(flatten)]
+    common: CommonArgs,
 
     /// Where the base snapshot comes from: `scan` (rescan the base ref),
     /// `file:<path>` (must exist), or `cache:<path>` (use if present, else
@@ -180,33 +183,9 @@ struct DiffArgs {
     #[arg(long = "report", value_name = "MODE")]
     report: Vec<String>,
 
-    /// Output format.
-    #[arg(short, long, default_value = "human")]
-    format: Format,
-
-    /// Write the report here instead of stdout.
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<PathBuf>,
-
-    /// Write the complete HEAD snapshot here (seeds the next baseline).
-    #[arg(long, value_name = "FILE")]
-    emit_snapshot: Option<PathBuf>,
-
     /// Exit non-zero when a *new* finding at or above this severity exists.
     #[arg(long, default_value = "error")]
     fail_on: String,
-
-    /// Findings-cache directory (see `scan --cache-dir`).
-    #[arg(long, value_name = "DIR")]
-    cache_dir: Option<PathBuf>,
-
-    /// Disable the findings cache entirely.
-    #[arg(long, conflicts_with = "cache_dir")]
-    no_cache: bool,
-
-    /// Print non-fatal warnings to stderr.
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 impl DiffArgs {
@@ -248,21 +227,14 @@ impl DiffArgs {
         };
         Ok(ScanArgs {
             paths: self.paths,
-            rules: self.rules,
-            language: self.language,
-            format: self.format,
-            output: self.output,
+            common: self.common,
             fail_on: self.fail_on,
             baseline,
             diff_mode: report,
-            emit_snapshot: self.emit_snapshot,
             on_baseline_mismatch: MismatchPolicy::Partition,
             fail_on_new: true,
-            cache_dir: self.cache_dir,
-            no_cache: self.no_cache,
             diff_base: Some(self.base),
             diff: None,
-            verbose: self.verbose,
         })
     }
 }
@@ -336,9 +308,9 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     let fail_on = Severity::parse_threshold(&args.fail_on)
         .with_context(|| format!("invalid --fail-on value '{}'", args.fail_on))?;
 
-    let rules = rule::load_paths(&args.rules)?;
+    let rules = rule::load_paths(&args.common.rules)?;
     if rules.is_empty() {
-        eprintln!("warning: no rules loaded from {:?}", args.rules);
+        eprintln!("warning: no rules loaded from {:?}", args.common.rules);
     }
 
     // Git context (if any): repo-relative finding paths make fingerprints
@@ -353,23 +325,15 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     let ruleset_id = snapshot::ruleset_id(&rules);
 
     // Findings cache: on by default (content-addressed keys make staleness
-    // structurally impossible), disabled by --no-cache. An unopenable cache
-    // degrades to uncached scanning, never to a failure.
-    let cache = if args.no_cache {
-        None
-    } else {
-        let dir = crit::cache::resolve_dir(
-            args.cache_dir.as_deref(),
-            git_ctx.as_ref().map(|c| c.root()),
-        );
-        match crit::cache::Cache::open(dir, ruleset_id.clone()) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("warning: cannot open findings cache ({e}); continuing without it");
-                None
-            }
-        }
-    };
+    // structurally impossible), disabled by --no-cache. Keyed by the *cache*
+    // ruleset identity, which also covers text copied into findings.
+    let cache = crit::cache::Cache::open_default(
+        args.common.no_cache,
+        args.common.cache_dir.as_deref(),
+        git_ctx.as_ref().map(|c| c.root()),
+        args.paths.first().map(|p| p.as_path()),
+        snapshot::ruleset_cache_id(&rules),
+    );
 
     let mut scanner = Scanner::new(registry, &rules);
     if let Some(ctx) = &git_ctx {
@@ -380,17 +344,23 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     }
     let mut report = ScanReport::default();
     for path in &args.paths {
-        scan_path(&scanner, path, args.language.as_deref(), &mut report)?;
+        scan_path(&scanner, path, args.common.language.as_deref(), &mut report)?;
     }
 
-    if args.verbose {
+    if args.common.verbose {
         for w in scanner.take_warnings() {
             eprintln!("warning: {w}");
         }
         if cache.is_some() {
             eprintln!(
-                "cache: {} of {} scanned file(s) served from cache",
-                report.files_cached, report.files_scanned
+                "cache: {} of {} scanned file(s) served from cache{}",
+                report.files_cached,
+                report.files_scanned,
+                if report.files_cached > 0 {
+                    " (cached files skip parse/query diagnostics)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -405,7 +375,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     // The complete HEAD snapshot — always the full set, never a diff subset.
     // vcs provenance costs two git subprocesses, so resolve it only when the
     // snapshot is actually serialized.
-    let wants_snapshot = args.emit_snapshot.is_some() || args.format == Format::Snapshot;
+    let wants_snapshot = args.common.emit_snapshot.is_some() || args.common.format == Format::Snapshot;
     let head_snapshot = Snapshot::from_findings(
         &report.findings,
         ruleset_id.clone(),
@@ -416,7 +386,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
             None
         },
     );
-    if let Some(path) = &args.emit_snapshot {
+    if let Some(path) = &args.common.emit_snapshot {
         std::fs::write(path, head_snapshot.to_json())
             .with_context(|| format!("writing snapshot {}", path.display()))?;
     }
@@ -449,7 +419,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
 
     let rendered = render(args, &report, &rules, &head_snapshot, outcome.as_ref(), &modes);
 
-    if let Some(out) = &args.output {
+    if let Some(out) = &args.common.output {
         std::fs::write(out, rendered).with_context(|| format!("writing {}", out.display()))?;
     } else {
         let mut stdout = std::io::stdout().lock();
@@ -698,7 +668,7 @@ fn scan_base_tree(env: &DiffEnv, ctx: &GitContext, base_commit: &str) -> Result<
         if !base_path.exists() {
             continue; // path introduced since base — nothing to scan there
         }
-        scan_path(&scanner, &base_path, env.args.language.as_deref(), &mut report)?;
+        scan_path(&scanner, &base_path, env.args.common.language.as_deref(), &mut report)?;
     }
     crit::finding::finalize(&mut report.findings);
 
@@ -720,14 +690,14 @@ fn render(
     modes: &[DiffMode],
 ) -> String {
     // The snapshot format is always the full HEAD set, never a diff subset.
-    if args.format == Format::Snapshot {
+    if args.common.format == Format::Snapshot {
         return head_snapshot.to_json();
     }
 
     match outcome {
         Some(o) => {
             let reported = o.reported(modes);
-            match args.format {
+            match args.common.format {
                 Format::Human => report::render_human_diff(
                     &reported,
                     o.counts(),
@@ -741,7 +711,7 @@ fn render(
                 Format::Snapshot => unreachable!("handled above"),
             }
         }
-        None => match args.format {
+        None => match args.common.format {
             Format::Human => {
                 report::render_human(&report.findings, report.files_scanned, report.files_skipped)
             }

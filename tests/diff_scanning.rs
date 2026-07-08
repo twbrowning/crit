@@ -11,6 +11,8 @@ use crit::language::LanguageRegistry;
 use crit::rule::{self, Rule};
 use crit::snapshot::{self, Snapshot};
 use std::collections::BTreeMap;
+mod common;
+use common::tempdir;
 use std::path::Path;
 
 fn load_rules() -> Vec<Rule> {
@@ -63,7 +65,7 @@ Sample ; routine
 
 #[test]
 fn fingerprint_survives_line_shift() {
-    let dir = tempdir();
+    let dir = tempdir("ds-shift");
     let rules = load_rules();
     let base = scan_source(dir.path(), "a.mac", BASE, &rules);
     let shifted = scan_source(dir.path(), "a.mac", SHIFTED, &rules);
@@ -86,7 +88,7 @@ fn fingerprint_survives_line_shift() {
 
 #[test]
 fn shifted_finding_reads_as_unchanged_not_new() {
-    let dir = tempdir();
+    let dir = tempdir("ds-unchanged");
     let rules = load_rules();
     let base = snapshot_of(&scan_source(dir.path(), "a.mac", BASE, &rules));
     let head = scan_source(dir.path(), "a.mac", SHIFTED, &rules);
@@ -103,7 +105,7 @@ fn shifted_finding_reads_as_unchanged_not_new() {
 
 #[test]
 fn genuinely_new_finding_is_reported_new() {
-    let dir = tempdir();
+    let dir = tempdir("ds-new");
     let rules = load_rules();
     let base = snapshot_of(&scan_source(dir.path(), "a.mac", BASE, &rules));
     let head_src = format!("{SHIFTED} set evil=\"do X^Y\"\n xecute evil\n");
@@ -117,7 +119,7 @@ fn genuinely_new_finding_is_reported_new() {
 
 #[test]
 fn edit_next_to_finding_reads_as_updated() {
-    let dir = tempdir();
+    let dir = tempdir("ds-updated");
     let rules = load_rules();
     let base = snapshot_of(&scan_source(dir.path(), "a.mac", BASE, &rules));
     // Change the line immediately above the xecute (inside its context window)
@@ -134,7 +136,7 @@ fn edit_next_to_finding_reads_as_updated() {
 
 #[test]
 fn removed_finding_is_reported_fixed() {
-    let dir = tempdir();
+    let dir = tempdir("ds-fixed");
     let rules = load_rules();
     let base = snapshot_of(&scan_source(dir.path(), "a.mac", BASE, &rules));
     let head = scan_source(dir.path(), "a.mac", "Sample ; routine\n quit\n", &rules);
@@ -150,7 +152,7 @@ fn removed_finding_is_reported_fixed() {
 
 #[test]
 fn snapshot_round_trips_through_disk() {
-    let dir = tempdir();
+    let dir = tempdir("ds-roundtrip");
     let rules = load_rules();
     let findings = scan_source(dir.path(), "a.mac", BASE, &rules);
     let snap = snapshot_of(&findings);
@@ -172,26 +174,3 @@ fn ruleset_id_changes_with_rules() {
     assert!(full.starts_with("sha256:"));
 }
 
-// --- a tiny tempdir helper so tests don't need an external crate ---
-
-struct TempDir(std::path::PathBuf);
-impl TempDir {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tempdir() -> TempDir {
-    // Deterministic-enough unique name without pulling in `rand`/`Date`.
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("crit-diff-test-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&base).expect("create tempdir");
-    TempDir(base)
-}

@@ -4,8 +4,9 @@
 
 #![cfg(feature = "bundled-objectscript")]
 
+mod common;
+use common::{crit, rules_dir, tempdir, TempDir};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const VULN: &str = "\
 Sample ; routine
@@ -18,23 +19,6 @@ const CLEAN: &str = "\
 Sample ; routine
  quit
 ";
-
-fn rules_dir() -> String {
-    format!("{}/rules", env!("CARGO_MANIFEST_DIR"))
-}
-
-fn crit(cwd: &Path, args: &[&str]) -> (String, String, Option<i32>) {
-    let out = Command::new(env!("CARGO_BIN_EXE_crit"))
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("crit runs");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-        out.status.code(),
-    )
-}
 
 fn scan_json(cwd: &Path) -> (String, String) {
     let (stdout, stderr, _) = crit(
@@ -139,6 +123,58 @@ fn cache_dir_is_git_self_ignoring() {
     assert_eq!(std::fs::read_to_string(gitignore).unwrap().trim(), "*");
 }
 
+/// Every rule attribute that shapes finding output must be part of the cache
+/// key: a message-only edit, a languages-scope edit, and a capture edit each
+/// have to miss — never serve the pre-edit findings for unchanged files.
+#[test]
+fn rule_edits_invalidate_cache() {
+    let dir = setup("ruleedit");
+    let rules = dir.path().join("rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    let rule_path = rules.join("x.scm");
+    let rule = |message: &str, languages: &str| {
+        format!(
+            "; id: t-xecute\n; message: {message}\n; severity: warning\n\
+             ; languages: {languages}\n(command_xecute) @match\n"
+        )
+    };
+    let scan = |tag_msg: &str| -> (String, String) {
+        let (stdout, stderr, _) = crit(
+            dir.path(),
+            &[
+                "scan", "src", "--rules", "rules",
+                "--cache-dir", "cache",
+                "--format", "json", "--fail-on", "off", "-v",
+            ],
+        );
+        (stdout, format!("{tag_msg}: {stderr}"))
+    };
+
+    std::fs::write(&rule_path, rule("old message", "objectscript")).unwrap();
+    scan("seed");
+    let (_, warm) = scan("warm");
+    assert!(warm.contains("cache: 3 of 3"), "{warm}");
+
+    // Message-only edit: same matches, different reported text — must miss
+    // and must report the new text everywhere.
+    std::fs::write(&rule_path, rule("new message", "objectscript")).unwrap();
+    let (stdout, stderr) = scan("msg-edit");
+    assert!(stderr.contains("cache: 0 of 3"), "message edit must invalidate: {stderr}");
+    assert!(stdout.contains("new message"), "{stdout}");
+    assert!(!stdout.contains("old message"), "stale message served: {stdout}");
+
+    // Languages-scope edit: narrows which files the rule runs on — must miss.
+    std::fs::write(&rule_path, rule("new message", "objectscript_udl")).unwrap();
+    let (stdout, stderr) = scan("lang-edit");
+    assert!(stderr.contains("cache: 0 of 3"), "languages edit must invalidate: {stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        doc["findings"].as_array().unwrap().len(),
+        0,
+        ".mac files are out of scope after narrowing: {stdout}"
+    );
+}
+
 // --- helpers ---
 
 fn walk(root: PathBuf) -> Vec<PathBuf> {
@@ -158,21 +194,3 @@ fn walk(root: PathBuf) -> Vec<PathBuf> {
     out
 }
 
-struct TempDir(PathBuf);
-impl TempDir {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tempdir(tag: &str) -> TempDir {
-    let base = std::env::temp_dir().join(format!("crit-cachetest-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).expect("create tempdir");
-    TempDir(base)
-}

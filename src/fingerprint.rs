@@ -29,6 +29,18 @@ use tree_sitter::Node;
 /// Default number of nearest ancestor node kinds folded into `structural_path`.
 pub const DEFAULT_ANCESTOR_DEPTH: usize = 3;
 
+/// Number of full source lines on each side of a match folded into its
+/// `context_hash`.
+pub const CONTEXT_LINES: usize = 2;
+
+/// Identity of the fingerprint *scheme* itself: hashed into cache keys so a
+/// change to these tuning constants (or the composition version) invalidates
+/// cached fingerprints/context hashes even if nobody remembers to bump the
+/// crate version.
+pub fn scheme_id(ancestor_depth: usize, context_lines: usize) -> String {
+    format!("fp/v2:d{ancestor_depth}:c{context_lines}")
+}
+
 /// Field separator for the hashed identity tuple. Chosen so it cannot occur in
 /// a node kind, a path, or normalized source.
 const SEP: char = '\u{1f}';
