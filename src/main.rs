@@ -126,6 +126,15 @@ struct ScanArgs {
     #[arg(long)]
     fail_on_new: bool,
 
+    /// Findings-cache directory (content-addressed; unchanged files are not
+    /// re-parsed). Defaults to `.crit/cache` under the repo root.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Disable the findings cache entirely.
+    #[arg(long, conflicts_with = "cache_dir")]
+    no_cache: bool,
+
     /// Git ref the change is against (e.g. origin/main). Enables diff
     /// attribution and rename tracking; with no `--baseline`, crit scans the
     /// base ref itself to derive one (costs one extra full scan).
@@ -187,6 +196,14 @@ struct DiffArgs {
     #[arg(long, default_value = "error")]
     fail_on: String,
 
+    /// Findings-cache directory (see `scan --cache-dir`).
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Disable the findings cache entirely.
+    #[arg(long, conflicts_with = "cache_dir")]
+    no_cache: bool,
+
     /// Print non-fatal warnings to stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -241,6 +258,8 @@ impl DiffArgs {
             emit_snapshot: self.emit_snapshot,
             on_baseline_mismatch: MismatchPolicy::Partition,
             fail_on_new: true,
+            cache_dir: self.cache_dir,
+            no_cache: self.no_cache,
             diff_base: Some(self.base),
             diff: None,
             verbose: self.verbose,
@@ -329,9 +348,35 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     // out-of-repo scans (bogus vcs provenance, bogus --diff-base).
     let git_ctx = args.paths.first().and_then(|p| GitContext::discover(p));
 
+    // Ruleset identity — needed up front: it is both the snapshot identity
+    // and a cache-key component.
+    let ruleset_id = snapshot::ruleset_id(&rules);
+
+    // Findings cache: on by default (content-addressed keys make staleness
+    // structurally impossible), disabled by --no-cache. An unopenable cache
+    // degrades to uncached scanning, never to a failure.
+    let cache = if args.no_cache {
+        None
+    } else {
+        let dir = crit::cache::resolve_dir(
+            args.cache_dir.as_deref(),
+            git_ctx.as_ref().map(|c| c.root()),
+        );
+        match crit::cache::Cache::open(dir, ruleset_id.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("warning: cannot open findings cache ({e}); continuing without it");
+                None
+            }
+        }
+    };
+
     let mut scanner = Scanner::new(registry, &rules);
     if let Some(ctx) = &git_ctx {
         scanner = scanner.with_path_root(ctx.root().to_path_buf());
+    }
+    if let Some(c) = &cache {
+        scanner = scanner.with_cache(c);
     }
     let mut report = ScanReport::default();
     for path in &args.paths {
@@ -342,6 +387,12 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         for w in scanner.take_warnings() {
             eprintln!("warning: {w}");
         }
+        if cache.is_some() {
+            eprintln!(
+                "cache: {} of {} scanned file(s) served from cache",
+                report.files_cached, report.files_scanned
+            );
+        }
     }
 
     // Canonicalize: sort (a documented, load-bearing ordering), dedup, and
@@ -349,7 +400,6 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     crit::finding::finalize(&mut report.findings);
 
     // Identity of this scan, for snapshots and comparability.
-    let ruleset_id = snapshot::ruleset_id(&rules);
     let grammar_versions = snapshot::grammar_versions(registry, &report.languages_seen);
 
     // The complete HEAD snapshot — always the full set, never a diff subset.
@@ -380,18 +430,19 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         || modes.iter().any(|m| *m != DiffMode::All);
 
     let outcome = if wants_diff {
+        let env = DiffEnv {
+            args,
+            registry,
+            rules: &rules,
+            git_ctx: git_ctx.as_ref(),
+            cache: cache.as_ref(),
+            ruleset_id: &ruleset_id,
+            grammar_versions: &grammar_versions,
+        };
         // The snapshot has been built; the findings can be moved out rather
         // than cloned through the diff pipeline.
         let head = std::mem::take(&mut report.findings);
-        Some(run_diff(
-            args,
-            registry,
-            &rules,
-            git_ctx.as_ref(),
-            head,
-            &ruleset_id,
-            &grammar_versions,
-        )?)
+        Some(run_diff(&env, head)?)
     } else {
         None
     };
@@ -442,24 +493,29 @@ fn parse_diff_modes(raw: &[String]) -> Result<Vec<DiffMode>> {
         .collect()
 }
 
+/// Everything the differential pipeline needs besides the findings
+/// themselves; one bundle instead of seven threaded parameters.
+struct DiffEnv<'a> {
+    args: &'a ScanArgs,
+    registry: &'a LanguageRegistry,
+    rules: &'a [Rule],
+    git_ctx: Option<&'a GitContext>,
+    cache: Option<&'a crit::cache::Cache>,
+    ruleset_id: &'a str,
+    grammar_versions: &'a std::collections::BTreeMap<String, String>,
+}
+
 /// Resolve the baseline (supplied file, base-ref rescan, or the loud
 /// "everything is new" fallback), apply the mismatch policy, diff, and
 /// attribute findings against the change's hunks. Takes ownership of the
 /// HEAD findings — no clones on the diff path.
-fn run_diff(
-    args: &ScanArgs,
-    registry: &LanguageRegistry,
-    rules: &[Rule],
-    git_ctx: Option<&GitContext>,
-    head: Vec<crit::finding::Finding>,
-    ruleset_id: &str,
-    grammar_versions: &std::collections::BTreeMap<String, String>,
-) -> Result<DiffOutcome> {
+fn run_diff(env: &DiffEnv, head: Vec<crit::finding::Finding>) -> Result<DiffOutcome> {
+    let args = env.args;
     // Hunk/rename information for attribution (and baseline path remapping).
     // Attribution is an annotation, never correctness: when a baseline
     // artifact is available the diff can proceed without it (e.g. merge-base
     // fails in a shallow CI clone), so degrade rather than abort.
-    let spec = match diff_spec(args, git_ctx) {
+    let spec = match diff_spec(args, env.git_ctx) {
         Ok(s) => s,
         Err(e) if args.baseline.is_some() => {
             eprintln!(
@@ -477,19 +533,18 @@ fn run_diff(
             if let Some(spec) = &spec {
                 baseline.remap_renames(spec.renames());
             }
-            let mismatches = baseline.comparability(ruleset_id, grammar_versions);
+            let mismatches = baseline.comparability(env.ruleset_id, env.grammar_versions);
             if mismatches.is_empty() {
                 DiffOutcome::diff(head, &baseline)
             } else {
-                mismatched_diff(args, registry, rules, git_ctx, head, &baseline, &mismatches, spec.as_ref())?
+                mismatched_diff(env, head, &baseline, &mismatches, spec.as_ref())?
             }
         }
         None => match &args.diff_base {
             // No baseline artifact, but a base ref: scan the base tree itself.
             // Same ruleset by construction, so no mismatch is possible.
             Some(base_ref) => {
-                let base_now =
-                    resolve_base_now(git_ctx, base_ref, args, registry, rules, spec.as_ref())?;
+                let base_now = resolve_base_now(env, base_ref, spec.as_ref())?;
                 DiffOutcome::diff(head, &base_now)
             }
             None => {
@@ -511,17 +566,14 @@ fn run_diff(
 
 /// Handle a baseline whose ruleset/engine/grammar identity differs from the
 /// current scan, per `--on-baseline-mismatch`.
-#[allow(clippy::too_many_arguments)]
 fn mismatched_diff(
-    args: &ScanArgs,
-    registry: &LanguageRegistry,
-    rules: &[Rule],
-    git_ctx: Option<&GitContext>,
+    env: &DiffEnv,
     head: Vec<crit::finding::Finding>,
     baseline: &Snapshot,
     mismatches: &[snapshot::Mismatch],
     spec: Option<&git::DiffSpec>,
 ) -> Result<DiffOutcome> {
+    let args = env.args;
     let summary = mismatches
         .iter()
         .map(|m| m.to_string())
@@ -559,8 +611,7 @@ fn mismatched_diff(
                 "note: baseline mismatch ({summary}); '{policy}': rescanning base \
                  '{base_ref}' with the current ruleset"
             );
-            let base_now =
-                resolve_base_now(git_ctx, base_ref, args, registry, rules, spec)?;
+            let base_now = resolve_base_now(env, base_ref, spec)?;
             if is_partition {
                 // Honest split: states vs base_now (code-relative), findings
                 // the old rules missed labelled new-due-to-ruleset.
@@ -578,17 +629,15 @@ fn mismatched_diff(
 /// against — never the moved-on branch tip), scan it, and apply rename
 /// remapping so its paths line up with HEAD's.
 fn resolve_base_now(
-    git_ctx: Option<&GitContext>,
+    env: &DiffEnv,
     base_ref: &str,
-    args: &ScanArgs,
-    registry: &LanguageRegistry,
-    rules: &[Rule],
     spec: Option<&git::DiffSpec>,
 ) -> Result<Snapshot> {
-    let ctx = git_ctx
+    let ctx = env
+        .git_ctx
         .context("--diff-base requires the scanned paths to be inside a git repository")?;
     let merge_base = ctx.merge_base(base_ref)?;
-    let mut base_now = scan_base_tree(ctx, &merge_base, args, registry, rules)?;
+    let mut base_now = scan_base_tree(env, ctx, &merge_base)?;
     if let Some(spec) = spec {
         base_now.remap_renames(spec.renames());
     }
@@ -623,18 +672,20 @@ fn diff_spec(args: &ScanArgs, git_ctx: Option<&GitContext>) -> Result<Option<git
 /// it (same rules, same language forcing, same relative paths), producing the
 /// base snapshot. Paths are relativized to the *worktree* root so fingerprints
 /// line up with the HEAD scan's repo-relative ones.
-fn scan_base_tree(
-    ctx: &GitContext,
-    base_commit: &str,
-    args: &ScanArgs,
-    registry: &LanguageRegistry,
-    rules: &[Rule],
-) -> Result<Snapshot> {
+fn scan_base_tree(env: &DiffEnv, ctx: &GitContext, base_commit: &str) -> Result<Snapshot> {
     let tree = ctx.materialize(base_commit)?;
-    let scanner = Scanner::new(registry, rules).with_path_root(tree.path().to_path_buf());
+    let mut scanner =
+        Scanner::new(env.registry, env.rules).with_path_root(tree.path().to_path_buf());
+    // The base scan shares the HEAD scan's cache: identity paths are
+    // worktree-relative on both sides, so unchanged files hit the entries the
+    // HEAD scan just wrote (and vice versa) — whole-tree completeness at
+    // roughly the cost of the changed subset.
+    if let Some(c) = env.cache {
+        scanner = scanner.with_cache(c);
+    }
 
     let mut report = ScanReport::default();
-    for path in &args.paths {
+    for path in &env.args.paths {
         // Map each scanned path into the base tree via its repo-relative form.
         let Some(rel) = git::relative_to(path, ctx.root()) else {
             eprintln!(
@@ -647,14 +698,14 @@ fn scan_base_tree(
         if !base_path.exists() {
             continue; // path introduced since base — nothing to scan there
         }
-        scan_path(&scanner, &base_path, args.language.as_deref(), &mut report)?;
+        scan_path(&scanner, &base_path, env.args.language.as_deref(), &mut report)?;
     }
     crit::finding::finalize(&mut report.findings);
 
     Ok(Snapshot::from_findings(
         &report.findings,
-        snapshot::ruleset_id(rules),
-        snapshot::grammar_versions(registry, &report.languages_seen),
+        env.ruleset_id.to_string(),
+        snapshot::grammar_versions(env.registry, &report.languages_seen),
         None,
     ))
 }

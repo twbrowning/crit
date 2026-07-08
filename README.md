@@ -137,6 +137,21 @@ path-independent `content_key`, so a renamed-but-unchanged finding's
 fingerprint is *recomposed* under the new path instead of decaying into
 fixed-old + new.
 
+### Incremental scanning (the findings cache)
+
+A file-local rule's findings are a pure function of `(path, file bytes,
+ruleset, grammar version, language, engine version)`, so crit memoizes them
+in a **content-addressed cache** (default `.crit/cache` under the repo root,
+git-self-ignored; `--cache-dir <DIR>` to relocate, `--no-cache` to disable).
+Every input is part of the key, so staleness is structurally impossible —
+a rules/grammar/engine change simply misses. Corrupt or unwritable entries
+degrade to misses; the cache can never fail or skew a scan.
+
+A full re-scan of a mostly-unchanged tree costs ≈ the changed subset. The same
+cache accelerates the PR flow: the base-tree scan shares entries with the HEAD
+scan for every unchanged file, so whole-tree completeness (the A→B guarantee)
+stays cheap.
+
 ### Comparability
 
 "New since BASE" can mean the *code* changed **or** the *rules/grammar/engine*

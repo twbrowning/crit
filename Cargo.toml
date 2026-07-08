@@ -3,7 +3,7 @@ name = "crit"
 # NOTE: this version is the snapshot `engine_version`; bump it whenever the
 # fingerprint scheme or finding-identity semantics change, so old baselines
 # surface as a comparability mismatch instead of silently mis-diffing.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A tree-sitter-based, language-agnostic source security scanner with first-class InterSystems ObjectScript support."
 license = "MIT"

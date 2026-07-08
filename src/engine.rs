@@ -30,6 +30,9 @@ pub struct ScanReport {
     pub findings: Vec<Finding>,
     pub files_scanned: usize,
     pub files_skipped: usize,
+    /// Of `files_scanned`, how many were served from the findings cache
+    /// without re-parsing.
+    pub files_cached: usize,
     /// Language ids that were actually resolved during the scan. Feeds the
     /// snapshot's `grammar_versions` so comparability is judged only against
     /// grammars this scan relied on.
@@ -49,6 +52,8 @@ pub struct Scanner<'a> {
     /// a HEAD scan in the real checkout produce identical identities — and
     /// makes snapshots portable across machines.
     path_root: Option<std::path::PathBuf>,
+    /// Content-addressed findings cache. `None` disables caching.
+    cache: Option<&'a crate::cache::Cache>,
 }
 
 impl<'a> Scanner<'a> {
@@ -59,6 +64,7 @@ impl<'a> Scanner<'a> {
             compiled: RefCell::new(HashMap::new()),
             warnings: RefCell::new(Vec::new()),
             path_root: None,
+            cache: None,
         }
     }
 
@@ -66,6 +72,12 @@ impl<'a> Scanner<'a> {
     /// is canonicalized once here so the per-file hot path doesn't redo it.
     pub fn with_path_root(mut self, root: std::path::PathBuf) -> Self {
         self.path_root = Some(root.canonicalize().unwrap_or(root));
+        self
+    }
+
+    /// Serve unchanged files from (and populate) a findings cache.
+    pub fn with_cache(mut self, cache: &'a crate::cache::Cache) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -164,6 +176,23 @@ impl<'a> Scanner<'a> {
             None => path.to_path_buf(),
         };
 
+        // Cache lookup: a file-local finding set is a pure function of the
+        // hashed key inputs, so a hit skips parse + queries entirely.
+        let id_str = fingerprint::identity_path(&id_path);
+        let cache_key = self.cache.map(|c| {
+            let content_hash = fingerprint::sha256_hex(&source);
+            c.key(&id_str, &content_hash, &entry.id, &entry.grammar_version())
+        });
+        if let (Some(cache), Some(key)) = (self.cache, cache_key.as_deref()) {
+            if let Some(cached) = cache.get(key) {
+                report.findings.extend(cached);
+                report.languages_seen.insert(entry.id.clone());
+                report.files_scanned += 1;
+                report.files_cached += 1;
+                return Ok(());
+            }
+        }
+
         let mut parser = Parser::new();
         parser
             .set_language(entry.language())
@@ -173,6 +202,9 @@ impl<'a> Scanner<'a> {
             .with_context(|| format!("parsing {}", path.display()))?;
 
         let compiled = self.compiled_for(&entry.id);
+        // Collected per file (not straight into the report) so the file's
+        // finding set can be cached as a unit.
+        let mut file_findings: Vec<Finding> = Vec::new();
         let root = tree.root_node();
         let mut cursor = QueryCursor::new();
         let mut buf1: Vec<u8> = Vec::new();
@@ -227,10 +259,10 @@ impl<'a> Scanner<'a> {
                 let structural =
                     fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
                 let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
-                let fp = fingerprint::compose(&fingerprint::identity_path(&id_path), &content_key);
+                let fp = fingerprint::compose(&id_str, &content_key);
                 let context_hash = fingerprint::context_hash(&source, node, CONTEXT_LINES);
 
-                report.findings.push(Finding {
+                file_findings.push(Finding {
                     rule_id: rule.id.clone(),
                     message: rule.message.clone(),
                     severity: rule.severity,
@@ -255,6 +287,10 @@ impl<'a> Scanner<'a> {
                 });
             }
         }
+        if let (Some(cache), Some(key)) = (self.cache, cache_key.as_deref()) {
+            cache.put(key, &file_findings);
+        }
+        report.findings.extend(file_findings);
         report.languages_seen.insert(entry.id.clone());
         report.files_scanned += 1;
         Ok(())

@@ -16,6 +16,7 @@
 #[cfg(feature = "bundled-objectscript")]
 pub mod bundled;
 
+pub mod cache;
 pub mod compile;
 pub mod diff;
 pub mod engine;
