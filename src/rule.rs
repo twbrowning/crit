@@ -20,6 +20,11 @@ pub enum Matcher {
     Query(String),
     /// Structured pattern compiled to a query on demand (per language).
     Pattern(Pattern),
+    /// A cross-file rule: `source` and `sink` queries evaluated over the
+    /// WHOLE tree and joined on the normalized text of their `@link`
+    /// captures. Findings are emitted at sinks whose link text some source —
+    /// in any scanned file — also captures. Never cached, never per-file.
+    CrossFile { source: String, sink: String },
 }
 
 /// A loaded, validated rule.
@@ -51,11 +56,21 @@ impl Rule {
         })
     }
 
-    /// Produce the tree-sitter query text for this rule.
+    /// Is this a cross-file (whole-tree, never-cached) rule?
+    pub fn is_cross_file(&self) -> bool {
+        matches!(self.matcher, Matcher::CrossFile { .. })
+    }
+
+    /// Produce the (per-file) tree-sitter query text for this rule. Errors
+    /// for cross-file rules — their source/sink queries run in the dedicated
+    /// whole-tree pass, never the per-file one.
     pub fn query_source(&self) -> Result<String, String> {
         match &self.matcher {
             Matcher::Query(q) => Ok(q.clone()),
             Matcher::Pattern(p) => compile::compile(p, &self.match_capture),
+            Matcher::CrossFile { .. } => {
+                Err("cross-file rule has no per-file query".to_string())
+            }
         }
     }
 }
@@ -80,6 +95,12 @@ struct RuleSpec {
     query: Option<String>,
     #[serde(default)]
     pattern: Option<Pattern>,
+    /// Cross-file source query (requires `sink`, excludes `query`/`pattern`).
+    #[serde(default)]
+    source: Option<String>,
+    /// Cross-file sink query (requires `source`).
+    #[serde(default)]
+    sink: Option<String>,
     #[serde(default)]
     capture: Option<String>,
     #[serde(default)]
@@ -106,15 +127,30 @@ impl RuleSpec {
         if let Some(l) = self.language {
             languages.push(l);
         }
-        let matcher = match (self.query, self.pattern) {
-            (Some(_), Some(_)) => {
-                bail!("rule '{}' sets both `query` and `pattern`; use exactly one", self.id)
+        let matcher = match (self.query, self.pattern, self.source, self.sink) {
+            (None, None, Some(source), Some(sink)) => Matcher::CrossFile { source, sink },
+            (None, None, Some(_), None) | (None, None, None, Some(_)) => {
+                bail!(
+                    "rule '{}': cross-file rules need both `source` and `sink`",
+                    self.id
+                )
             }
-            (Some(q), None) => Matcher::Query(q),
-            (None, Some(p)) => Matcher::Pattern(p),
-            (None, None) => {
-                bail!("rule '{}' must set either `query` or `pattern`", self.id)
-            }
+            (query, pattern, None, None) => match (query, pattern) {
+                (Some(_), Some(_)) => {
+                    bail!("rule '{}' sets both `query` and `pattern`; use exactly one", self.id)
+                }
+                (Some(q), None) => Matcher::Query(q),
+                (None, Some(p)) => Matcher::Pattern(p),
+                (None, None) => bail!(
+                    "rule '{}' must set `query`, `pattern`, or `source`+`sink`",
+                    self.id
+                ),
+            },
+            _ => bail!(
+                "rule '{}' mixes `source`/`sink` with `query`/`pattern`; \
+                 a rule is either per-file or cross-file",
+                self.id
+            ),
         };
         Ok(Rule {
             id: self.id,

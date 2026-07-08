@@ -346,6 +346,8 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     for path in &args.paths {
         scan_path(&scanner, path, args.common.language.as_deref(), &mut report)?;
     }
+    // Whole-tree pass for cross-file rules (no-op without any).
+    scanner.cross_file_pass(&mut report)?;
 
     if args.common.verbose {
         for w in scanner.take_warnings() {
@@ -670,6 +672,9 @@ fn scan_base_tree(env: &DiffEnv, ctx: &GitContext, base_commit: &str) -> Result<
         }
         scan_path(&scanner, &base_path, env.args.common.language.as_deref(), &mut report)?;
     }
+    // A→B correctness cuts both ways: the BASE finding set must include
+    // cross-file findings too, or removing a source would not read as fixed.
+    scanner.cross_file_pass(&mut report)?;
     crit::finding::finalize(&mut report.findings);
 
     Ok(Snapshot::from_findings(
@@ -784,6 +789,7 @@ fn list_rules(rules: &[Rule]) {
         let format = match r.matcher {
             rule::Matcher::Query(_) => "query",
             rule::Matcher::Pattern(_) => "pattern",
+            rule::Matcher::CrossFile { .. } => "cross-file",
         };
         println!(
             "{:<40} {:<9} {:<28} {}",

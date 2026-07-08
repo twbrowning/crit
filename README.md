@@ -225,6 +225,35 @@ pattern:
 no descendant combinator, `children` are *direct* children — one level of YAML
 nesting per level of the syntax tree. Use `crit dump-ast` to see the shape.
 
+### 3. Cross-file rules (`source:` + `sink:`)
+
+A rule can declare a **source** and a **sink** query instead of a per-file
+matcher. Both queries capture a join key as `@link`; the queries run over the
+**whole tree** (never per-file, never cached), and a finding is emitted at
+every sink whose normalized `@link` text some source — in any scanned file,
+including the sink's own — also captures. The finding's message names the
+(earliest) source location; its identity lives at the sink, so a source
+merely moving does not churn the fingerprint.
+
+```yaml
+id: os-crossfile-global-xecute
+message: XECUTE of a global that is written elsewhere in the codebase…
+severity: error
+languages: [objectscript]
+source: |
+  (set_argument (set_target (glvn (gvn) @link)))
+sink: |
+  ((command_xecute (xecute_argument (expression (expr_atom (gvn) @link)))) @match)
+```
+
+This is what makes the A→B differential story real: a PR that only touches
+file A (adding a writer of `^TASKS("cmd")`) produces a **new** finding in
+untouched file B (which executes that global) — state `new`, attributed
+`in_unchanged_file` — because correctness is defined as the whole-tree
+finding-set difference, never diff locality. Cross-file findings are excluded
+from the per-file cache by construction (and editing a cross-file rule leaves
+per-file cache entries warm).
+
 A YAML file may hold a single rule, a top-level list, or `{ rules: [ ... ] }`.
 
 ## Bundled ObjectScript rules
@@ -241,6 +270,7 @@ covering both authoring formats:
 | `os-hardcoded-credential-parameter`  | error    | Secret-named class `Parameter` with literal  | pattern   |
 | `os-dynamic-exec-xecute`             | warning  | `XECUTE` (dynamic code execution)            | `.scm`    |
 | `os-indirection-review`              | info     | Indirection (`@`) dynamic evaluation         | pattern   |
+| `os-crossfile-global-xecute`         | error    | `XECUTE` of a global written elsewhere       | cross-file |
 
 ## Scanning another language (dynamic grammars)
 

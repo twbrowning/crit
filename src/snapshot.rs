@@ -321,9 +321,14 @@ pub fn ruleset_id(rules: &[Rule]) -> String {
 /// message). This is the cache-key component — a reworded `message:` must
 /// miss the cache even though the finding set is unchanged, or warm scans
 /// serve stale text.
+///
+/// Covers the **file-local** subset only: cross-file rules are never cached
+/// (their findings depend on other files), so editing one must not — and
+/// does not — invalidate per-file entries. This function owns that filter so
+/// callers cannot get it wrong.
 pub fn ruleset_cache_id(rules: &[Rule]) -> String {
     let mut parts: Vec<String> = vec!["crit.ruleset-cache/v1".to_string()];
-    for r in rules {
+    for r in rules.iter().filter(|r| !r.is_cross_file()) {
         push_semantic_identity(&mut parts, r);
         parts.push(r.message.clone());
     }
@@ -336,7 +341,17 @@ fn push_semantic_identity(parts: &mut Vec<String>, r: &Rule) {
     parts.push(r.severity.as_str().to_string());
     parts.push(r.languages.join(","));
     parts.push(r.match_capture.clone());
-    parts.push(r.query_source().unwrap_or_else(|e| format!("<uncompilable:{e}>")));
+    // The match logic itself: per-file query text, or the cross-file
+    // source/sink pair (which query_source cannot express).
+    match &r.matcher {
+        crate::rule::Matcher::CrossFile { source, sink } => {
+            parts.push(format!("cross-file\u{1f}{source}\u{1f}{sink}"));
+        }
+        _ => parts.push(
+            r.query_source()
+                .unwrap_or_else(|e| format!("<uncompilable:{e}>")),
+        ),
+    }
 }
 
 /// The grammar-version map for the languages a scan actually touched.

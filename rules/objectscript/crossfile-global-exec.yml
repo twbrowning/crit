@@ -1,0 +1,16 @@
+# The cross-file rule class: `source:` + `sink:` tree-sitter queries joined on
+# the normalized text of their `@link` captures, evaluated over the WHOLE tree
+# (never per-file, never cached). A finding is emitted at each sink whose link
+# text some source (in any scanned file, including the sink's own) also
+# captures.
+id: os-crossfile-global-xecute
+message: >-
+  XECUTE of a global that is written elsewhere in the codebase; if any writer
+  is attacker-influenced this is stored code injection.
+severity: error
+languages: [objectscript]
+cwe: CWE-94
+source: |
+  (set_argument (set_target (glvn (gvn) @link)))
+sink: |
+  ((command_xecute (xecute_argument (expression (expr_atom (gvn) @link)))) @match)
