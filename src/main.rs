@@ -425,24 +425,52 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         // The snapshot has been built; the findings can be moved out rather
         // than cloned through the diff pipeline.
         let head = std::mem::take(&mut report.findings);
-        Some(run_diff(&env, head)?)
+        match run_diff(&env, head) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                // The HEAD scan completed; a diff failure (baseline mismatch
+                // under `fail`, corrupt baseline, git trouble) must not
+                // discard its snapshot — CI baseline chains depend on it.
+                if let Some(path) = &args.common.emit_snapshot {
+                    if std::fs::write(path, head_snapshot.to_json()).is_ok() {
+                        eprintln!(
+                            "note: wrote {} before failing, so the HEAD scan is not lost",
+                            path.display()
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
     } else {
         None
     };
 
-    // Carry the consumed baseline's triaged fingerprints forward, then emit.
+    // Carry the consumed baseline's triaged fingerprints forward — but only
+    // those still matching a finding present at HEAD. Suppressions of fixed
+    // (or otherwise vanished) findings expire here, so dead fingerprints
+    // never accumulate or pre-suppress a future colliding finding.
     if let Some(o) = &outcome {
-        let mut carried: Vec<String> = o.suppressed.iter().cloned().collect();
+        let hidden_at_head = o
+            .annotated
+            .iter()
+            .filter(|f| f.state.map(|s| s.present_at_head()).unwrap_or(true))
+            .filter(|f| o.suppressed.contains(&f.fingerprint))
+            .count();
+        let mut carried: Vec<String> = o
+            .annotated
+            .iter()
+            .filter(|f| f.state.map(|s| s.present_at_head()).unwrap_or(true))
+            .map(|f| f.fingerprint.clone())
+            .filter(|fp| o.suppressed.contains(fp))
+            .collect();
         carried.sort();
+        carried.dedup();
         head_snapshot.suppressions = carried;
         if args.common.verbose && !o.suppressed.is_empty() {
-            let n = o
-                .annotated
-                .iter()
-                .filter(|f| o.suppressed.contains(&f.fingerprint))
-                .count();
             eprintln!(
-                "suppressions: {n} finding(s) hidden by the baseline's {} triaged fingerprint(s)",
+                "suppressions: {hidden_at_head} finding(s) hidden by the baseline's \
+                 {} triaged fingerprint(s)",
                 o.suppressed.len()
             );
         }
@@ -621,6 +649,22 @@ fn mismatched_diff(
                  '{base_ref}' with the current ruleset"
             );
             let base_now = resolve_base_now(env, base_ref, spec)?;
+            // A fingerprint-scheme change (e.g. --fingerprint-depth) makes
+            // the old baseline's fingerprints structurally unmatchable: the
+            // partition's "old rules missed it" labels and its suppressions
+            // would compare apples to oranges. States vs the freshly
+            // rescanned base are still exact — use those alone.
+            let scheme_changed = mismatches
+                .iter()
+                .any(|m| matches!(m, snapshot::Mismatch::FingerprintDepth { .. }));
+            if scheme_changed {
+                eprintln!(
+                    "note: the fingerprint scheme changed, so the old baseline's \
+                     fingerprints (and its suppressions) cannot be matched; \
+                     reporting states against the rescanned base only"
+                );
+                return Ok(DiffOutcome::diff(head, &base_now));
+            }
             if is_partition {
                 // Honest split: states vs base_now (code-relative), findings
                 // the old rules missed labelled new-due-to-ruleset.

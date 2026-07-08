@@ -356,7 +356,9 @@ fn baseline_suppressions_hide_and_carry_forward() {
         .as_str()
         .unwrap()
         .to_string();
-    snap["suppressions"] = serde_json::json!([zf_fp]);
+    // A second, dead fingerprint (its finding no longer exists) must expire
+    // on carry-forward instead of riding every future baseline.
+    snap["suppressions"] = serde_json::json!([zf_fp, "deadbeef-stale-fingerprint"]);
     std::fs::write(repo.join("base.json"), snap.to_string()).unwrap();
 
     // Re-scan against the triaged baseline: the suppressed error must not be
@@ -384,7 +386,11 @@ fn baseline_suppressions_hide_and_carry_forward() {
         next["findings"].as_array().unwrap().iter().any(|f| f["fingerprint"] == zf_fp.as_str()),
         "the emitted snapshot stays complete"
     );
-    assert_eq!(next["suppressions"], serde_json::json!([zf_fp]), "carried forward");
+    assert_eq!(
+        next["suppressions"],
+        serde_json::json!([zf_fp]),
+        "live suppression carried forward, dead one expired"
+    );
 }
 
 /// --fingerprint-depth changes identity: snapshots record it and a mixed-depth

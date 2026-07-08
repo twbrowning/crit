@@ -186,9 +186,14 @@ impl DiffOutcome {
         }
     }
 
+    /// State tallies over the *visible* set — suppressed findings are triaged
+    /// away, so they appear in no report and in no summary either.
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
         for f in &self.annotated {
+            if self.suppressed.contains(&f.fingerprint) {
+                continue;
+            }
             match f.state {
                 Some(FindingState::New) => c.new += 1,
                 Some(FindingState::Unchanged) => c.unchanged += 1,

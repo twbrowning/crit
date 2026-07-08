@@ -238,6 +238,9 @@ impl Snapshot {
             .map(|(o, n)| (o.as_str(), n.as_str()))
             .collect();
         let mut remapped = 0;
+        // Suppressions pin fingerprints too: track old → new so a triaged
+        // finding in a renamed file stays triaged instead of resurfacing.
+        let mut fp_map: HashMap<String, String> = HashMap::new();
         for f in &mut self.findings {
             let key = fingerprint::identity_path(&f.file);
             if let Some(new_path) = map.get(key.as_str()) {
@@ -245,11 +248,17 @@ impl Snapshot {
                     continue; // old snapshot: cannot recompose safely
                 }
                 f.file = std::path::PathBuf::from(new_path);
-                f.fingerprint = fingerprint::compose(new_path, &f.content_key);
+                let new_fp = fingerprint::compose(new_path, &f.content_key);
+                fp_map.insert(std::mem::replace(&mut f.fingerprint, new_fp.clone()), new_fp);
                 remapped += 1;
             }
         }
         if remapped > 0 {
+            for s in &mut self.suppressions {
+                if let Some(new_fp) = fp_map.get(s) {
+                    *s = new_fp.clone();
+                }
+            }
             // Recomposition can merge findings from two files under one path
             // (rename onto a deleted file's name), breaking the
             // "(fingerprint, occurrence) unique within a snapshot" invariant
