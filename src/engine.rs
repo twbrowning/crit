@@ -2,11 +2,12 @@
 //! turn matches into [`Finding`]s.
 
 use crate::finding::{Finding, Position};
+use crate::fingerprint;
 use crate::language::LanguageRegistry;
 use crate::rule::Rule;
 use anyhow::{Context, Result};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
@@ -19,12 +20,20 @@ struct CompiledRule {
     match_capture_ix: Option<u32>,
 }
 
+/// Number of full source lines on each side of a match folded into its
+/// `context_hash`.
+const CONTEXT_LINES: usize = 2;
+
 /// Summary returned by a multi-path scan.
 #[derive(Debug, Default)]
 pub struct ScanReport {
     pub findings: Vec<Finding>,
     pub files_scanned: usize,
     pub files_skipped: usize,
+    /// Language ids that were actually resolved during the scan. Feeds the
+    /// snapshot's `grammar_versions` so comparability is judged only against
+    /// grammars this scan relied on.
+    pub languages_seen: BTreeSet<String>,
 }
 
 pub struct Scanner<'a> {
@@ -171,6 +180,20 @@ impl<'a> Scanner<'a> {
                 let start = node.start_position();
                 let end = node.end_position();
                 let snippet = source_line(&source, start.row);
+
+                // Stable identity: independent of absolute line numbers so a
+                // finding survives edits above it (see `crate::fingerprint`).
+                let normalized = fingerprint::normalized_match_text(&source, node);
+                let structural =
+                    fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
+                let fp = fingerprint::compose(
+                    &rule.id,
+                    &path.to_string_lossy(),
+                    &normalized,
+                    &structural,
+                );
+                let context_hash = fingerprint::context_hash(&source, node, CONTEXT_LINES);
+
                 report.findings.push(Finding {
                     rule_id: rule.id.clone(),
                     message: rule.message.clone(),
@@ -186,9 +209,14 @@ impl<'a> Scanner<'a> {
                         column: end.column + 1,
                     },
                     snippet,
+                    fingerprint: fp,
+                    context_hash,
+                    occurrence: 0,
+                    state: None,
                 });
             }
         }
+        report.languages_seen.insert(entry.id.clone());
         report.files_scanned += 1;
         Ok(())
     }

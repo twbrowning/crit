@@ -27,6 +27,13 @@ impl LanguageEntry {
     pub fn language(&self) -> &Language {
         &self.language
     }
+
+    /// The grammar's tree-sitter ABI version. Used as the grammar identity in a
+    /// snapshot's `grammar_versions`: a grammar upgrade that changes node kinds
+    /// (and therefore can legitimately flag old code) bumps this.
+    pub fn grammar_version(&self) -> String {
+        self.language.abi_version().to_string()
+    }
 }
 
 /// Schema for the dynamic-language TOML config (`--languages-config`).

@@ -3,7 +3,7 @@
 mod human;
 mod sarif;
 
-pub use human::render_human;
+pub use human::{render_human, render_human_diff};
 pub use sarif::render_sarif;
 
 use crate::finding::Finding;
@@ -15,6 +15,9 @@ pub enum Format {
     Human,
     Sarif,
     Json,
+    /// The `crit.snapshot/v1` artifact — the complete HEAD finding set, suitable
+    /// as the next run's baseline. Always the full set, never a diff subset.
+    Snapshot,
 }
 
 impl std::str::FromStr for Format {
@@ -24,7 +27,10 @@ impl std::str::FromStr for Format {
             "human" | "text" => Ok(Format::Human),
             "sarif" => Ok(Format::Sarif),
             "json" => Ok(Format::Json),
-            other => Err(format!("unknown format '{other}' (expected human|sarif|json)")),
+            "snapshot" => Ok(Format::Snapshot),
+            other => Err(format!(
+                "unknown format '{other}' (expected human|sarif|json|snapshot)"
+            )),
         }
     }
 }

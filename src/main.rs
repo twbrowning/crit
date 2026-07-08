@@ -1,15 +1,42 @@
 //! catseye CLI.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use catseye::diff::{DiffMode, DiffOutcome};
 use catseye::engine::{ScanReport, Scanner};
 use catseye::finding::Severity;
 use catseye::language::LanguageRegistry;
 use catseye::report::{self, Format};
 use catseye::rule::{self, Rule};
+use catseye::snapshot::{self, Snapshot};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+/// Policy for when a baseline snapshot's ruleset/engine/grammar identity differs
+/// from the current scan's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchPolicy {
+    Fail,
+    Warn,
+    Partition,
+    RescanBase,
+}
+
+impl std::str::FromStr for MismatchPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "fail" => Ok(MismatchPolicy::Fail),
+            "warn" => Ok(MismatchPolicy::Warn),
+            "partition" => Ok(MismatchPolicy::Partition),
+            "rescan-base" | "rescan_base" => Ok(MismatchPolicy::RescanBase),
+            other => Err(format!(
+                "unknown --on-baseline-mismatch '{other}' (expected fail|warn|partition|rescan-base)"
+            )),
+        }
+    }
+}
 
 /// A tree-sitter-based, language-agnostic source security scanner.
 #[derive(Parser)]
@@ -65,6 +92,32 @@ struct ScanArgs {
     /// (error|warning|info|note|off).
     #[arg(long, default_value = "error")]
     fail_on: String,
+
+    /// Prior snapshot to diff against (the baseline). Enables differential
+    /// reporting; produce one with `--emit-snapshot` or `--format snapshot`.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+
+    /// What to report, relative to the baseline: all|new|fixed|updated.
+    /// Repeatable; the report is the union. `new` is the PR gate; `all`
+    /// (the default) is the whole-tree behaviour.
+    #[arg(long = "diff-mode", value_name = "MODE")]
+    diff_mode: Vec<String>,
+
+    /// Always write the complete HEAD snapshot here (seeds the next baseline),
+    /// regardless of `--diff-mode`/`--format`.
+    #[arg(long, value_name = "FILE")]
+    emit_snapshot: Option<PathBuf>,
+
+    /// What to do when the baseline's ruleset/engine/grammar identity differs
+    /// from this scan: fail|warn|partition|rescan-base.
+    #[arg(long, default_value = "warn")]
+    on_baseline_mismatch: MismatchPolicy,
+
+    /// With a baseline, gate the exit code on *new* findings only (nightly
+    /// full-backlog jobs leave this off).
+    #[arg(long)]
+    fail_on_new: bool,
 
     /// Print non-fatal warnings (e.g. rules skipped for a grammar) to stderr.
     #[arg(short, long)]
@@ -154,36 +207,39 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         }
     }
 
-    // Sort findings by file, then position, for stable output.
-    report.findings.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.start.line.cmp(&b.start.line))
-            .then(a.start.column.cmp(&b.start.column))
-            .then(a.end.line.cmp(&b.end.line))
-            .then(a.end.column.cmp(&b.end.column))
-            .then(a.rule_id.cmp(&b.rule_id))
-    });
-    // De-duplicate identical findings (the same rule can match a node via
-    // several internal combinations, e.g. multiple concatenation operators).
-    report.findings.dedup_by(|a, b| {
-        a.rule_id == b.rule_id
-            && a.file == b.file
-            && a.start.line == b.start.line
-            && a.start.column == b.start.column
-            && a.end.line == b.end.line
-            && a.end.column == b.end.column
-    });
+    // Canonicalize: sort (a documented, load-bearing ordering), dedup, and
+    // assign fingerprint occurrence indices.
+    catseye::finding::finalize(&mut report.findings);
 
-    let rendered = match args.format {
-        Format::Human => {
-            report::render_human(&report.findings, report.files_scanned, report.files_skipped)
-        }
-        Format::Sarif => report::render_sarif(&report.findings, &rules),
-        Format::Json => {
-            report::render_json(&report.findings, report.files_scanned, report.files_skipped)
-        }
+    // Identity of this scan, for snapshots and comparability.
+    let ruleset_id = snapshot::ruleset_id(&rules);
+    let grammar_versions = snapshot::grammar_versions(registry, &report.languages_seen);
+
+    // The complete HEAD snapshot — always the full set, never a diff subset.
+    let head_snapshot = Snapshot::from_findings(
+        &report.findings,
+        ruleset_id.clone(),
+        grammar_versions.clone(),
+        None,
+    );
+    if let Some(path) = &args.emit_snapshot {
+        std::fs::write(path, head_snapshot.to_json())
+            .with_context(|| format!("writing snapshot {}", path.display()))?;
+    }
+
+    // Resolve requested diff modes (default: the whole-tree `all` behaviour).
+    let modes = parse_diff_modes(&args.diff_mode)?;
+    let wants_diff = args.baseline.is_some()
+        || args.fail_on_new
+        || modes.iter().any(|m| *m != DiffMode::All);
+
+    let outcome = if wants_diff {
+        Some(run_diff(args, &report, &ruleset_id, &grammar_versions)?)
+    } else {
+        None
     };
+
+    let rendered = render(args, &report, &rules, &head_snapshot, outcome.as_ref(), &modes);
 
     if let Some(out) = &args.output {
         std::fs::write(out, rendered).with_context(|| format!("writing {}", out.display()))?;
@@ -192,14 +248,143 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         stdout.write_all(rendered.as_bytes())?;
     }
 
-    // Decide exit code from the fail-on threshold.
+    // Decide exit code from the fail-on threshold. When diffing, the gate
+    // tracks the *reported* set (so `--diff-mode new` fails only on new), and
+    // `--fail-on-new` narrows it to new findings regardless of the report.
+    // Fixed (`absent`) findings are never present at HEAD, so they never gate.
     if let Some(threshold) = fail_on {
-        let tripped = report.findings.iter().any(|f| f.severity <= threshold);
+        let tripped = match &outcome {
+            Some(o) => o
+                .reported(&modes)
+                .iter()
+                .filter(|f| f.state.map(|s| s.present_at_head()).unwrap_or(true))
+                .filter(|f| {
+                    !args.fail_on_new || f.state == Some(catseye::finding::FindingState::New)
+                })
+                .any(|f| f.severity <= threshold),
+            None => report.findings.iter().any(|f| f.severity <= threshold),
+        };
         if tripped {
             return Ok(ExitCode::from(1));
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Parse `--diff-mode` values; an empty list defaults to `all` (today's
+/// whole-tree behaviour).
+fn parse_diff_modes(raw: &[String]) -> Result<Vec<DiffMode>> {
+    if raw.is_empty() {
+        return Ok(vec![DiffMode::All]);
+    }
+    raw.iter()
+        .map(|s| s.parse::<DiffMode>().map_err(|e| anyhow::anyhow!(e)))
+        .collect()
+}
+
+/// Load the baseline (or synthesise the "everything is new" case), applying the
+/// baseline-mismatch policy, and produce the annotated diff outcome.
+fn run_diff(
+    args: &ScanArgs,
+    report: &ScanReport,
+    ruleset_id: &str,
+    grammar_versions: &std::collections::BTreeMap<String, String>,
+) -> Result<DiffOutcome> {
+    let baseline_path = match &args.baseline {
+        Some(p) => p,
+        None => {
+            // Diff requested with no baseline: never silently report zero.
+            eprintln!(
+                "warning: --diff-mode/--fail-on-new set without --baseline; \
+                 treating every finding as new"
+            );
+            return Ok(DiffOutcome::all_new(report.findings.clone()));
+        }
+    };
+
+    let baseline = Snapshot::load(baseline_path)?;
+    let mismatches = baseline.comparability(ruleset_id, grammar_versions);
+    if !mismatches.is_empty() {
+        let summary = mismatches
+            .iter()
+            .map(|m| m.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        match args.on_baseline_mismatch {
+            MismatchPolicy::Fail => {
+                bail!(
+                    "baseline mismatch ({summary}); refusing to diff \
+                     (--on-baseline-mismatch fail)"
+                );
+            }
+            MismatchPolicy::Warn => {
+                eprintln!(
+                    "warning: baseline mismatch ({summary}); diffing anyway — \
+                     'new' findings may include ruleset/grammar-induced ones"
+                );
+            }
+            MismatchPolicy::Partition | MismatchPolicy::RescanBase => {
+                // Honest partitioning needs the base *source* to re-derive the
+                // base finding set with the current ruleset — that is the git
+                // integration phase. Until then, degrade to `warn`.
+                eprintln!(
+                    "warning: baseline mismatch ({summary}); \
+                     '{}' needs the base source (git integration, a later phase) — \
+                     falling back to 'warn' and diffing anyway",
+                    match args.on_baseline_mismatch {
+                        MismatchPolicy::Partition => "partition",
+                        _ => "rescan-base",
+                    }
+                );
+            }
+        }
+    }
+
+    Ok(DiffOutcome::diff(report.findings.clone(), &baseline))
+}
+
+/// Render the report in the requested format, differential when diffing.
+fn render(
+    args: &ScanArgs,
+    report: &ScanReport,
+    rules: &[Rule],
+    head_snapshot: &Snapshot,
+    outcome: Option<&DiffOutcome>,
+    modes: &[DiffMode],
+) -> String {
+    // The snapshot format is always the full HEAD set, never a diff subset.
+    if args.format == Format::Snapshot {
+        return head_snapshot.to_json();
+    }
+
+    match outcome {
+        Some(o) => {
+            let reported = o.reported(modes);
+            match args.format {
+                Format::Human => report::render_human_diff(
+                    &reported,
+                    o.counts(),
+                    report.files_scanned,
+                    report.files_skipped,
+                ),
+                Format::Sarif => report::render_sarif(&reported, rules),
+                Format::Json => {
+                    report::render_json(&reported, report.files_scanned, report.files_skipped)
+                }
+                Format::Snapshot => unreachable!("handled above"),
+            }
+        }
+        None => match args.format {
+            Format::Human => {
+                report::render_human(&report.findings, report.files_scanned, report.files_skipped)
+            }
+            Format::Sarif => report::render_sarif(&report.findings, rules),
+            Format::Json => {
+                report::render_json(&report.findings, report.files_scanned, report.files_skipped)
+            }
+            Format::Snapshot => unreachable!("handled above"),
+        },
+    }
 }
 
 /// Recurse into directories, scanning each file.

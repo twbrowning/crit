@@ -66,7 +66,73 @@ catseye list-rules --rules rules/
 Exit codes: `0` clean (or below threshold), `1` a finding at/above `--fail-on`
 (default `error`; use `off` to disable), `2` an error.
 
-Output formats: `human` (default, colorized), `sarif` (SARIF 2.1.0), `json`.
+Output formats: `human` (default, colorized), `sarif` (SARIF 2.1.0), `json`,
+`snapshot` (the `crit.snapshot/v1` artifact — see below).
+
+## Differential ("what changed") scanning
+
+catseye can surface only the issues a change *introduces*, rather than the whole
+backlog — the PR-review use case. Correctness is defined at the level of
+**findings**, never lines:
+
+> `new(PR) = findings(HEAD) − findings(BASE)`, compared by a stable, line-number-
+> independent **fingerprint**, over the *complete* tree at each ref.
+
+Because the whole tree is evaluated at HEAD, a change in file A that causes a new
+finding in an otherwise-unchanged file B is still caught — diff locality is never
+traded for completeness.
+
+### The snapshot artifact
+
+The one stateful concept is a **snapshot**: the complete, fingerprinted finding
+set of one scan, plus the provenance (`ruleset_id`, `engine_version`,
+`grammar_versions`) needed to know whether two snapshots are comparable. catseye
+*emits* it and *consumes* it as a baseline — it never commits anything itself, so
+a PR run never edits PR contents.
+
+```sh
+# On the base ref (e.g. in CI, keyed by base SHA), produce a baseline:
+catseye scan src/ --rules rules/ --emit-snapshot base.snapshot.json
+
+# On the PR, report only what's new and gate CI on new findings only:
+catseye scan src/ --rules rules/ \
+        --baseline base.snapshot.json \
+        --diff-mode new --fail-on-new --fail-on error
+```
+
+### Flags (all additive; the default is today's whole-tree behaviour)
+
+| Flag | Meaning |
+|------|---------|
+| `--baseline <FILE>` | Prior snapshot to diff against. |
+| `--diff-mode <all\|new\|fixed\|updated>` | What to report (repeatable; the union). `new` is the PR gate; `all` is the default. |
+| `--emit-snapshot <FILE>` | Always writes the **complete** HEAD finding set (seeds the next baseline), even under `--diff-mode new`. |
+| `--fail-on-new` | Gate the exit code on *new* findings only (nightly `--diff-mode all` jobs leave it off and fail on the full backlog). |
+| `--on-baseline-mismatch <fail\|warn\|partition\|rescan-base>` | What to do when the baseline's ruleset/engine/grammar identity differs from this scan. Default `warn`. |
+
+Each finding carries a **state** (`new` / `unchanged` / `updated` / `absent`):
+
+* **human** groups findings into *New in this change* / *Pre-existing* / *Fixed*;
+* **SARIF** populates `result.baselineState` and `partialFingerprints`, so GitHub
+  code scanning shows "new in this PR" natively — no git or artifact plumbing;
+* **JSON** adds `fingerprint`, `context_hash`, `occurrence`, and `state` per hit.
+
+### Comparability
+
+"New since BASE" can mean the *code* changed **or** the *rules/grammar/engine*
+changed (an upgraded rule legitimately flags old code). The snapshot records
+`ruleset_id`, `engine_version`, and `grammar_versions`; on a mismatch,
+`--on-baseline-mismatch` decides. `fail` and `warn` need no base source;
+`partition`/`rescan-base` re-derive the base finding set with the *current* rules
+and require the base **source** (git integration — a later phase) — until then
+they degrade to `warn` with a note.
+
+> **Scope note.** This is phase 1 of the design: fingerprints, snapshot
+> emit/consume, `--diff-mode`, and differential JSON/SARIF/human output, using a
+> CI-supplied baseline (the no-repo-write path). Git integration (`--diff-base`,
+> base-tree rescanning, per-line diff attribution) and the content-addressed
+> incremental cache are later phases; the machinery here is built to accept them
+> without a schema change.
 
 ## Writing rules
 
@@ -171,7 +237,11 @@ The suite validates:
 * **Rule matching** ([`tests/rule_matching.rs`](tests/rule_matching.rs)) — the
   shipped rules fire on vulnerable fixtures and stay silent on clean ones, across
   both authoring formats, with severities and predicate filtering verified.
-* **Pattern compiler** (unit tests in `src/compile.rs`).
+* **Diff scanning** ([`tests/diff_scanning.rs`](tests/diff_scanning.rs)) —
+  fingerprints survive line-number shifts, snapshots round-trip through disk, and
+  new/unchanged/updated/fixed classification drives the PR gate.
+* **Pattern compiler** and **fingerprint/snapshot/diff** (unit tests in
+  `src/compile.rs`, `src/fingerprint.rs`, `src/snapshot.rs`, `src/diff.rs`).
 
 ## Layout
 
@@ -184,7 +254,10 @@ src/
   rule.rs                    # rule model + YAML/.scm loaders
   compile.rs                 # structured pattern -> tree-sitter query
   engine.rs                  # parse + run queries + collect findings
-  report/                    # human, SARIF, JSON output
+  fingerprint.rs             # stable, position-independent finding identity
+  snapshot.rs                # crit.snapshot/v1 emit/consume + comparability
+  diff.rs                    # differential ("what changed") analysis
+  report/                    # human, SARIF, JSON, snapshot output
 rules/objectscript/          # example security rules
 tests/                       # consumption + rule-matching tests + fixtures
 examples/                    # dynamic-language config + JSON rule

@@ -26,7 +26,7 @@ pub fn render_sarif(findings: &[Finding], rules: &[Rule]) -> String {
     let results: Vec<Value> = findings
         .iter()
         .map(|f| {
-            json!({
+            let mut result = json!({
                 "ruleId": f.rule_id,
                 "ruleIndex": rule_index[f.rule_id.as_str()],
                 "level": f.severity.sarif_level(),
@@ -44,7 +44,23 @@ pub fn render_sarif(findings: &[Finding], rules: &[Rule]) -> String {
                     }
                 }],
                 "properties": { "language": f.language }
-            })
+            });
+            let obj = result.as_object_mut().unwrap();
+            // Stable identity so GitHub code scanning (and any SARIF consumer)
+            // can track a finding across line-number shifts. `occurrence`
+            // disambiguates structurally identical matches in one file.
+            if !f.fingerprint.is_empty() {
+                obj.insert(
+                    "partialFingerprints".into(),
+                    json!({ "critFingerprint/v1": format!("{}:{}", f.fingerprint, f.occurrence) }),
+                );
+            }
+            // Native SARIF baseline state: GitHub then shows "new in this PR"
+            // without any git or artifact plumbing on our side.
+            if let Some(state) = f.state {
+                obj.insert("baselineState".into(), json!(state.sarif_baseline_state()));
+            }
+            result
         })
         .collect();
 
