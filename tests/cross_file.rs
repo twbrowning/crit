@@ -7,9 +7,8 @@
 #![cfg(feature = "bundled-objectscript")]
 
 mod common;
-use common::{crit, parse_findings, rules_dir, tempdir};
+use common::{crit, git, parse_findings, rules_dir, tempdir};
 use std::path::Path;
-use std::process::Command;
 
 const RULE_ID: &str = "os-crossfile-global-xecute";
 
@@ -35,22 +34,6 @@ Writer ; file A
  set ^TASKS(\"cmd\") = input
  quit
 ";
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 fn crossfile_findings(json: &str) -> Vec<serde_json::Value> {
     parse_findings(json)

@@ -11,9 +11,7 @@
 #![cfg(feature = "bundled-objectscript")]
 
 mod common;
-use common::{crit, parse_findings, rules_dir, tempdir, TempDir};
-use std::path::Path;
-use std::process::Command;
+use common::{crit, git, parse_findings, rules_dir, tempdir, TempDir};
 
 const VULN_XECUTE: &str = "\
 Sample ; routine
@@ -27,29 +25,6 @@ Util ; routine
  set rc = $ZF(-1, \"/bin/sh -c whoami\")
  quit
 ";
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 /// Build the standard two-commit fixture repo:
 /// base  = app.mac (one xecute vuln) + old-name.mac (one $ZF vuln)

@@ -51,10 +51,24 @@ pub struct ScanReport {
     /// snapshot's `grammar_versions` so comparability is judged only against
     /// grammars this scan relied on.
     pub languages_seen: BTreeSet<String>,
-    /// Every (on-disk path, language id) the scan visited — including cache
-    /// hits, which skip parsing. The cross-file pass re-walks exactly this
-    /// set: its rules need every file's tree, cached or not.
-    pub visited: BTreeSet<(std::path::PathBuf, String)>,
+    /// Cross-file rule state accumulated during the per-file walk, consumed
+    /// by [`Scanner::cross_file_pass`].
+    cross: CrossState,
+}
+
+/// Cross-file candidates gathered while scanning. Freshly parsed files have
+/// their sources/sinks collected inline (no second parse, and from the exact
+/// bytes the per-file scan hashed); cache-hit files — whose trees were never
+/// built this run — stash their already-read bytes for the deferred pass.
+#[derive(Debug, Default)]
+struct CrossState {
+    /// `(rule index, link text)` → earliest source location, for the message.
+    sources: std::collections::BTreeMap<(usize, String), (String, usize)>,
+    /// Sink candidates: `(rule index, link text, finding prototype)`.
+    sinks: Vec<(usize, String, Finding)>,
+    /// Cache-hit files still owing cross-file collection:
+    /// `(on-disk path, language id, source bytes)`.
+    pending: Vec<(std::path::PathBuf, String, Vec<u8>)>,
 }
 
 pub struct Scanner<'a> {
@@ -194,19 +208,37 @@ impl<'a> Scanner<'a> {
         });
         let cached = cache_entry.as_ref().and_then(|(c, k)| c.get(k));
         let was_cached = cached.is_some();
+        let has_cross = !self.cross_compiled_for(&entry.id).is_empty();
         let file_findings = match cached {
-            Some(v) => v,
+            // Cache hit: no tree was built this run, so if cross-file rules
+            // apply, stash the already-read bytes for the deferred pass —
+            // the pass then parses exactly what this scan hashed, never a
+            // possibly-newer on-disk state.
+            Some(v) => {
+                if has_cross {
+                    report
+                        .cross
+                        .pending
+                        .push((path.to_path_buf(), entry.id.clone(), source));
+                }
+                v
+            }
             None => {
-                let fresh = self.run_file_queries(path, &source, entry, &id_path, &id_str)?;
+                let tree = parse(&source, entry, path)?;
+                let fresh = self.run_file_queries(&tree, &source, entry, &id_path, &id_str);
                 if let Some((c, k)) = &cache_entry {
                     c.put(k, &fresh);
+                }
+                // Cross-file candidates are collected from the same parse —
+                // fresh files never pay a second read or parse.
+                if has_cross {
+                    self.collect_cross(&tree, &source, entry, &id_path, &id_str, report);
                 }
                 fresh
             }
         };
         report.findings.extend(file_findings);
         report.languages_seen.insert(entry.id.clone());
-        report.visited.insert((path.to_path_buf(), entry.id.clone()));
         report.files_scanned += 1;
         if was_cached {
             report.files_cached += 1;
@@ -239,24 +271,60 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Parse one file and run every applicable compiled rule query over it,
-    /// returning the file's finding set (the unit the cache stores).
-    fn run_file_queries(
+    /// The one place a finding is materialized from a matched node: the full
+    /// identity recipe (normalized text → structural path → content key →
+    /// fingerprint → context hash) plus the display fields. Per-file and
+    /// cross-file findings MUST share this, or the two pipelines drift onto
+    /// different identity schemes within a single snapshot.
+    fn make_finding(
         &self,
-        path: &Path,
+        rule: &Rule,
+        node: tree_sitter::Node,
         source: &[u8],
         entry: &crate::language::LanguageEntry,
         id_path: &Path,
         id_str: &str,
-    ) -> Result<Vec<Finding>> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(entry.language())
-            .with_context(|| format!("setting language '{}'", entry.id))?;
-        let tree = parser
-            .parse(source, None)
-            .with_context(|| format!("parsing {}", path.display()))?;
+    ) -> Finding {
+        let start = node.start_position();
+        let end = node.end_position();
+        let normalized = fingerprint::normalized_match_text(source, node);
+        let structural = fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
+        let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
+        Finding {
+            rule_id: rule.id.clone(),
+            message: rule.message.clone(),
+            severity: rule.severity,
+            language: entry.id.clone(),
+            file: id_path.to_path_buf(),
+            start: Position {
+                line: start.row + 1,
+                column: start.column + 1,
+            },
+            end: Position {
+                line: end.row + 1,
+                column: end.column + 1,
+            },
+            snippet: source_line(source, start.row),
+            fingerprint: fingerprint::compose(id_str, &content_key),
+            content_key,
+            context_hash: fingerprint::context_hash(source, node, CONTEXT_LINES),
+            occurrence: 0,
+            state: None,
+            diff_relation: None,
+            new_cause: None,
+        }
+    }
 
+    /// Run every applicable compiled per-file rule query over a parsed tree,
+    /// returning the file's finding set (the unit the cache stores).
+    fn run_file_queries(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &[u8],
+        entry: &crate::language::LanguageEntry,
+        id_path: &Path,
+        id_str: &str,
+    ) -> Vec<Finding> {
         let compiled = self.compiled_for(&entry.id);
         let mut file_findings: Vec<Finding> = Vec::new();
         let root = tree.root_node();
@@ -303,45 +371,10 @@ impl<'a> Scanner<'a> {
                     Some(n) => n,
                     None => continue,
                 };
-                let start = node.start_position();
-                let end = node.end_position();
-                let snippet = source_line(source, start.row);
-
-                // Stable identity: independent of absolute line numbers so a
-                // finding survives edits above it (see `crate::fingerprint`).
-                let normalized = fingerprint::normalized_match_text(source, node);
-                let structural =
-                    fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
-                let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
-                let fp = fingerprint::compose(id_str, &content_key);
-                let context_hash = fingerprint::context_hash(source, node, CONTEXT_LINES);
-
-                file_findings.push(Finding {
-                    rule_id: rule.id.clone(),
-                    message: rule.message.clone(),
-                    severity: rule.severity,
-                    language: entry.id.clone(),
-                    file: id_path.to_path_buf(),
-                    start: Position {
-                        line: start.row + 1,
-                        column: start.column + 1,
-                    },
-                    end: Position {
-                        line: end.row + 1,
-                        column: end.column + 1,
-                    },
-                    snippet,
-                    fingerprint: fp,
-                    content_key,
-                    context_hash,
-                    occurrence: 0,
-                    state: None,
-                    diff_relation: None,
-                    new_cause: None,
-                });
+                file_findings.push(self.make_finding(rule, node, source, entry, id_path, id_str));
             }
         }
-        Ok(file_findings)
+        file_findings
     }
 
     /// Compile (once) the cross-file rules applicable to a language.
@@ -362,26 +395,7 @@ impl<'a> Scanner<'a> {
             let crate::rule::Matcher::CrossFile { source, sink } = &rule.matcher else {
                 continue;
             };
-            let compiled = (|| -> Result<CompiledCrossRule, String> {
-                let source_q = Query::new(language, source).map_err(|e| format!("source: {e}"))?;
-                let sink_q = Query::new(language, sink).map_err(|e| format!("sink: {e}"))?;
-                let source_link_ix = source_q
-                    .capture_index_for_name(LINK_CAPTURE)
-                    .ok_or_else(|| format!("source query has no @{LINK_CAPTURE} capture"))?;
-                let sink_link_ix = sink_q
-                    .capture_index_for_name(LINK_CAPTURE)
-                    .ok_or_else(|| format!("sink query has no @{LINK_CAPTURE} capture"))?;
-                let sink_match_ix = sink_q.capture_index_for_name(&rule.match_capture);
-                Ok(CompiledCrossRule {
-                    rule_idx,
-                    source: source_q,
-                    source_link_ix,
-                    sink: sink_q,
-                    sink_link_ix,
-                    sink_match_ix,
-                })
-            })();
-            match compiled {
+            match compile_cross_rule(language, rule, rule_idx, source, sink) {
                 Ok(c) => items.push(c),
                 Err(e) => self.warnings.borrow_mut().push(format!(
                     "cross-file rule '{}' does not compile for language '{lang_id}': {e}",
@@ -396,10 +410,77 @@ impl<'a> Scanner<'a> {
         rc
     }
 
-    /// The whole-tree pass for cross-file rules: re-walk every visited file
-    /// (cache hits included — their trees were never parsed this run),
-    /// collect `@link`-keyed sources and sinks per rule, join, and emit a
-    /// finding at every sink whose link some source also captures.
+    /// Collect one parsed file's cross-file sources and sinks into the
+    /// report's [`CrossState`]. Called inline for freshly parsed files and
+    /// from [`Self::cross_file_pass`] for cache-hit files.
+    fn collect_cross(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &[u8],
+        entry: &crate::language::LanguageEntry,
+        id_path: &Path,
+        id_str: &str,
+        report: &mut ScanReport,
+    ) {
+        let compiled = self.cross_compiled_for(&entry.id);
+        let root = tree.root_node();
+        let mut cursor = QueryCursor::new();
+        let mut buf1: Vec<u8> = Vec::new();
+        let mut buf2: Vec<u8> = Vec::new();
+        for cr in compiled.iter() {
+            let rule = &self.rules[cr.rule_idx];
+
+            // Sources: record each link key's earliest location.
+            let mut matches = cursor.matches(&cr.source, root, source);
+            while let Some(m) = matches.next() {
+                let mut tp: &[u8] = source;
+                if !m.satisfies_text_predicates(&cr.source, &mut buf1, &mut buf2, &mut tp) {
+                    continue;
+                }
+                for node in m.nodes_for_capture_index(cr.source_link_ix) {
+                    let link = fingerprint::normalized_match_text(source, node);
+                    let loc = (id_str.to_string(), node.start_position().row + 1);
+                    report
+                        .cross
+                        .sources
+                        .entry((cr.rule_idx, link))
+                        .and_modify(|cur| {
+                            if loc < *cur {
+                                *cur = loc.clone();
+                            }
+                        })
+                        .or_insert(loc);
+                }
+            }
+
+            // Sinks: build finding prototypes keyed by their link text.
+            let mut matches = cursor.matches(&cr.sink, root, source);
+            while let Some(m) = matches.next() {
+                let mut tp: &[u8] = source;
+                if !m.satisfies_text_predicates(&cr.sink, &mut buf1, &mut buf2, &mut tp) {
+                    continue;
+                }
+                let Some(link_node) = m.nodes_for_capture_index(cr.sink_link_ix).next() else {
+                    continue;
+                };
+                let link = fingerprint::normalized_match_text(source, link_node);
+                let node = cr
+                    .sink_match_ix
+                    .and_then(|ix| m.nodes_for_capture_index(ix).next())
+                    .unwrap_or(link_node);
+                report.cross.sinks.push((
+                    cr.rule_idx,
+                    link,
+                    self.make_finding(rule, node, source, entry, id_path, id_str),
+                ));
+            }
+        }
+    }
+
+    /// Finish the cross-file analysis: parse the stashed bytes of cache-hit
+    /// files (fresh files were collected inline during the walk), then join
+    /// sources to sinks and emit a finding at every sink whose `@link` text
+    /// some source — in any scanned file — also captured.
     ///
     /// These findings are NEVER cached: they are a function of the whole
     /// tree, so no per-file key can be correct for them. Identity works like
@@ -408,137 +489,72 @@ impl<'a> Scanner<'a> {
     /// finding in untouched file B, and the whole-tree snapshot diff
     /// surfaces it.
     pub fn cross_file_pass(&self, report: &mut ScanReport) -> Result<()> {
-        if !self.rules.iter().any(|r| r.is_cross_file()) {
-            return Ok(());
-        }
-
-        // (rule_idx, link text) → earliest source location, for the message.
-        let mut sources: std::collections::BTreeMap<(usize, String), (String, usize)> =
-            std::collections::BTreeMap::new();
-        // Sink candidates: finding prototype + its join key.
-        let mut sinks: Vec<(usize, String, Finding)> = Vec::new();
-
-        for (path, lang_id) in report.visited.clone() {
-            let compiled = self.cross_compiled_for(&lang_id);
-            if compiled.is_empty() {
-                continue;
-            }
+        for (path, lang_id, source) in std::mem::take(&mut report.cross.pending) {
             let entry = self
                 .registry
                 .by_id(&lang_id)
                 .expect("visited language must be registered");
-            let source_bytes = std::fs::read(&path)
-                .with_context(|| format!("reading source file {}", path.display()))?;
-            let mut parser = Parser::new();
-            parser
-                .set_language(entry.language())
-                .with_context(|| format!("setting language '{}'", entry.id))?;
-            let tree = parser
-                .parse(&source_bytes, None)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            let root = tree.root_node();
+            let tree = parse(&source, entry, &path)?;
             let id_path = self.id_path_for(&path);
             let id_str = fingerprint::identity_path(&id_path);
-
-            let mut cursor = QueryCursor::new();
-            let mut buf1: Vec<u8> = Vec::new();
-            let mut buf2: Vec<u8> = Vec::new();
-            for cr in compiled.iter() {
-                let rule = &self.rules[cr.rule_idx];
-
-                // Sources: record each link key's earliest location.
-                let mut matches = cursor.matches(&cr.source, root, source_bytes.as_slice());
-                while let Some(m) = matches.next() {
-                    let mut tp: &[u8] = source_bytes.as_slice();
-                    if !m.satisfies_text_predicates(&cr.source, &mut buf1, &mut buf2, &mut tp) {
-                        continue;
-                    }
-                    for node in m.nodes_for_capture_index(cr.source_link_ix) {
-                        let link = fingerprint::normalized_match_text(&source_bytes, node);
-                        let loc = (id_str.clone(), node.start_position().row + 1);
-                        sources
-                            .entry((cr.rule_idx, link))
-                            .and_modify(|cur| {
-                                if loc < *cur {
-                                    *cur = loc.clone();
-                                }
-                            })
-                            .or_insert(loc);
-                    }
-                }
-
-                // Sinks: build finding prototypes keyed by their link text.
-                let mut matches = cursor.matches(&cr.sink, root, source_bytes.as_slice());
-                while let Some(m) = matches.next() {
-                    let mut tp: &[u8] = source_bytes.as_slice();
-                    if !m.satisfies_text_predicates(&cr.sink, &mut buf1, &mut buf2, &mut tp) {
-                        continue;
-                    }
-                    let Some(link_node) = m.nodes_for_capture_index(cr.sink_link_ix).next()
-                    else {
-                        continue;
-                    };
-                    let link = fingerprint::normalized_match_text(&source_bytes, link_node);
-                    let node = cr
-                        .sink_match_ix
-                        .and_then(|ix| m.nodes_for_capture_index(ix).next())
-                        .unwrap_or(link_node);
-
-                    let start = node.start_position();
-                    let end = node.end_position();
-                    let normalized = fingerprint::normalized_match_text(&source_bytes, node);
-                    let structural =
-                        fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
-                    let content_key =
-                        fingerprint::content_key(&rule.id, &normalized, &structural);
-                    sinks.push((
-                        cr.rule_idx,
-                        link,
-                        Finding {
-                            rule_id: rule.id.clone(),
-                            message: rule.message.clone(),
-                            severity: rule.severity,
-                            language: entry.id.clone(),
-                            file: id_path.clone(),
-                            start: Position {
-                                line: start.row + 1,
-                                column: start.column + 1,
-                            },
-                            end: Position {
-                                line: end.row + 1,
-                                column: end.column + 1,
-                            },
-                            snippet: source_line(&source_bytes, start.row),
-                            fingerprint: fingerprint::compose(&id_str, &content_key),
-                            content_key,
-                            context_hash: fingerprint::context_hash(
-                                &source_bytes,
-                                node,
-                                CONTEXT_LINES,
-                            ),
-                            occurrence: 0,
-                            state: None,
-                            diff_relation: None,
-                            new_cause: None,
-                        },
-                    ));
-                }
-            }
+            self.collect_cross(&tree, &source, entry, &id_path, &id_str, report);
         }
 
-        // Join: a sink fires when any source shares its link key. The source
-        // location is appended to the message (deterministically: earliest
-        // location wins) but never to the identity — a source merely moving
-        // must not churn the sink's fingerprint.
-        for (rule_idx, link, mut finding) in sinks {
-            if let Some((src_file, src_line)) = sources.get(&(rule_idx, link.clone())) {
-                finding.message =
-                    format!("{} (source: {src_file}:{src_line})", finding.message);
+        // Join. The source location is appended to the message
+        // (deterministically: earliest location wins) but never to the
+        // identity — a source merely moving must not churn the sink's
+        // fingerprint.
+        let sources = std::mem::take(&mut report.cross.sources);
+        for (rule_idx, link, mut finding) in std::mem::take(&mut report.cross.sinks) {
+            if let Some((src_file, src_line)) = sources.get(&(rule_idx, link)) {
+                finding.message = format!("{} (source: {src_file}:{src_line})", finding.message);
                 report.findings.push(finding);
             }
         }
         Ok(())
     }
+}
+
+/// Parse `source` with `entry`'s grammar (`path` is for error context only).
+fn parse(
+    source: &[u8],
+    entry: &crate::language::LanguageEntry,
+    path: &Path,
+) -> Result<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(entry.language())
+        .with_context(|| format!("setting language '{}'", entry.id))?;
+    parser
+        .parse(source, None)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Compile one cross-file rule's source/sink queries for a language.
+fn compile_cross_rule(
+    language: &tree_sitter::Language,
+    rule: &Rule,
+    rule_idx: usize,
+    source: &str,
+    sink: &str,
+) -> Result<CompiledCrossRule, String> {
+    let source_q = Query::new(language, source).map_err(|e| format!("source: {e}"))?;
+    let sink_q = Query::new(language, sink).map_err(|e| format!("sink: {e}"))?;
+    let source_link_ix = source_q
+        .capture_index_for_name(LINK_CAPTURE)
+        .ok_or_else(|| format!("source query has no @{LINK_CAPTURE} capture"))?;
+    let sink_link_ix = sink_q
+        .capture_index_for_name(LINK_CAPTURE)
+        .ok_or_else(|| format!("sink query has no @{LINK_CAPTURE} capture"))?;
+    let sink_match_ix = sink_q.capture_index_for_name(&rule.match_capture);
+    Ok(CompiledCrossRule {
+        rule_idx,
+        source: source_q,
+        source_link_ix,
+        sink: sink_q,
+        sink_link_ix,
+        sink_match_ix,
+    })
 }
 
 /// Extract a single 0-based line of source for display, lossy-decoded.
