@@ -101,6 +101,11 @@ pub struct Snapshot {
     /// Hash over rule ids + query sources + severities. Doubles as a cache-key
     /// component and as the ruleset-identity used for comparability.
     pub ruleset_id: String,
+    /// Structural-path ancestor depth the fingerprints were computed with
+    /// (`--fingerprint-depth`). Part of comparability: mixed-depth snapshots
+    /// cannot be diffed meaningfully.
+    #[serde(default = "default_fingerprint_depth")]
+    pub fingerprint_depth: usize,
     pub grammar_versions: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcs: Option<Vcs>,
@@ -122,6 +127,7 @@ impl Snapshot {
             schema: SCHEMA.to_string(),
             engine_version: engine_version(),
             ruleset_id,
+            fingerprint_depth: default_fingerprint_depth(),
             grammar_versions,
             vcs,
             findings: findings.iter().map(SnapshotFinding::from_finding).collect(),
@@ -175,12 +181,19 @@ impl Snapshot {
         &self,
         current_ruleset_id: &str,
         current_grammars: &BTreeMap<String, String>,
+        current_fingerprint_depth: usize,
     ) -> Vec<Mismatch> {
         let mut out = Vec::new();
         if self.ruleset_id != current_ruleset_id {
             out.push(Mismatch::Ruleset {
                 base: self.ruleset_id.clone(),
                 current: current_ruleset_id.to_string(),
+            });
+        }
+        if self.fingerprint_depth != current_fingerprint_depth {
+            out.push(Mismatch::FingerprintDepth {
+                base: self.fingerprint_depth,
+                current: current_fingerprint_depth,
             });
         }
         let current_engine = engine_version();
@@ -271,6 +284,7 @@ impl Snapshot {
 pub enum Mismatch {
     Ruleset { base: String, current: String },
     Engine { base: String, current: String },
+    FingerprintDepth { base: usize, current: usize },
     Grammar {
         language: String,
         base: String,
@@ -287,6 +301,9 @@ impl std::fmt::Display for Mismatch {
             Mismatch::Engine { base, current } => {
                 write!(f, "engine version changed ({base} → {current})")
             }
+            Mismatch::FingerprintDepth { base, current } => {
+                write!(f, "fingerprint depth changed ({base} → {current})")
+            }
             Mismatch::Grammar {
                 language,
                 base,
@@ -294,6 +311,10 @@ impl std::fmt::Display for Mismatch {
             } => write!(f, "grammar '{language}' changed ({base} → {current})"),
         }
     }
+}
+
+fn default_fingerprint_depth() -> usize {
+    fingerprint::DEFAULT_ANCESTOR_DEPTH
 }
 
 /// crit's engine/version string, as recorded in and checked against snapshots.
@@ -416,7 +437,14 @@ mod tests {
             None,
         );
         let current = BTreeMap::from([("objectscript".to_string(), "15".to_string())]);
-        let mm = snap.comparability("sha256:new", &current);
+        let mm = snap.comparability("sha256:new", &current, fingerprint::DEFAULT_ANCESTOR_DEPTH);
         assert_eq!(mm.len(), 2); // ruleset + grammar
+
+        let mm = snap.comparability(
+            &snap.ruleset_id,
+            &snap.grammar_versions,
+            fingerprint::DEFAULT_ANCESTOR_DEPTH + 1,
+        );
+        assert_eq!(mm.len(), 1, "depth change alone must flag: {mm:?}");
     }
 }

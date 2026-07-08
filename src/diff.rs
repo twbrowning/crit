@@ -69,10 +69,15 @@ pub struct Counts {
 
 /// The complete annotated finding set of a diff: every HEAD finding tagged with
 /// its state, plus reconstructed `absent` (fixed) findings from the baseline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DiffOutcome {
     /// All findings, each with `state` set, in deterministic order.
     pub annotated: Vec<Finding>,
+    /// Accepted/triaged fingerprints from the baseline's `suppressions` list:
+    /// excluded from every *report* and from the exit gate, but never from
+    /// the emitted snapshot (the full set stays complete, and the list is
+    /// carried forward so the next baseline keeps suppressing).
+    pub suppressed: HashSet<String>,
 }
 
 impl DiffOutcome {
@@ -112,7 +117,10 @@ impl DiffOutcome {
         }
 
         sort_annotated(&mut head);
-        Self { annotated: head }
+        Self {
+            annotated: head,
+            suppressed: baseline.suppressions.iter().cloned().collect(),
+        }
     }
 
     /// Treat every HEAD finding as `new`. Used for the "no baseline available"
@@ -122,7 +130,10 @@ impl DiffOutcome {
             f.state = Some(FindingState::New);
         }
         sort_annotated(&mut head);
-        Self { annotated: head }
+        Self {
+            annotated: head,
+            suppressed: HashSet::new(),
+        }
     }
 
     /// Partitioned diff, for a ruleset/engine mismatch with the base *source*
@@ -136,6 +147,11 @@ impl DiffOutcome {
     /// engine bump, reported separately, and never tripping the new-code gate.
     pub fn diff_partitioned(head: Vec<Finding>, base_old: &Snapshot, base_now: &Snapshot) -> Self {
         let mut outcome = Self::diff(head, base_now);
+        // Triaged fingerprints live in the *supplied* baseline (base_old);
+        // the fresh base rescan has none.
+        outcome
+            .suppressed
+            .extend(base_old.suppressions.iter().cloned());
         let in_old: HashSet<(&str, usize)> = base_old
             .findings
             .iter()
@@ -187,9 +203,12 @@ impl DiffOutcome {
     /// The subset to report, given the requested modes (their union). Under a
     /// partitioned diff, `new` also admits ruleset-induced findings — they are
     /// what the partition exists to surface (separately labelled, not gated).
+    /// Suppressed fingerprints never appear in a report (or the gate, which
+    /// runs over this set), only in the complete emitted snapshot.
     pub fn reported(&self, modes: &[DiffMode]) -> Vec<Finding> {
         self.annotated
             .iter()
+            .filter(|f| !self.suppressed.contains(&f.fingerprint))
             .filter(|f| {
                 let by_state = f
                     .state

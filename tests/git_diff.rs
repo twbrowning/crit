@@ -327,3 +327,96 @@ fn old_scheme_baseline_is_rejected() {
     );
 }
 
+
+/// A fingerprint listed in the baseline's `suppressions` disappears from
+/// every report and from the gate, but stays in the emitted snapshot (full
+/// set) with the suppression list carried forward.
+#[test]
+fn baseline_suppressions_hide_and_carry_forward() {
+    let (dir, _) = fixture_repo("suppress");
+    let repo = dir.path();
+
+    // Produce a HEAD snapshot, then triage one error finding into it.
+    let (_, _, code) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--format", "snapshot", "-o", "base.json", "--fail-on", "off",
+        ],
+    );
+    assert_eq!(code, Some(0));
+    let mut snap: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("base.json")).unwrap()).unwrap();
+    let zf_fp = snap["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule_id"] == "os-command-execution-zf")
+        .expect("zf finding in snapshot")["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    snap["suppressions"] = serde_json::json!([zf_fp]);
+    std::fs::write(repo.join("base.json"), snap.to_string()).unwrap();
+
+    // Re-scan against the triaged baseline: the suppressed error must not be
+    // reported and must not gate, and the emitted snapshot keeps both the
+    // finding (full set) and the suppression list.
+    let (stdout, _, code) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--baseline", "base.json",
+            "--emit-snapshot", "next.json",
+            "--format", "json", "--fail-on", "error",
+        ],
+    );
+    let findings = parse_findings(&stdout);
+    assert!(
+        !findings.iter().any(|f| f["fingerprint"] == zf_fp.as_str()),
+        "suppressed finding must not be reported: {findings:?}"
+    );
+    assert_eq!(code, Some(0), "the suppressed error must not gate");
+
+    let next: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("next.json")).unwrap()).unwrap();
+    assert!(
+        next["findings"].as_array().unwrap().iter().any(|f| f["fingerprint"] == zf_fp.as_str()),
+        "the emitted snapshot stays complete"
+    );
+    assert_eq!(next["suppressions"], serde_json::json!([zf_fp]), "carried forward");
+}
+
+/// --fingerprint-depth changes identity: snapshots record it and a mixed-depth
+/// diff is flagged as a comparability mismatch instead of silently mis-diffing.
+#[test]
+fn fingerprint_depth_mismatch_is_flagged() {
+    let (dir, _) = fixture_repo("fpdepth");
+    let repo = dir.path();
+    let (_, _, code) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--fingerprint-depth", "4",
+            "--format", "snapshot", "-o", "d4.json", "--fail-on", "off",
+        ],
+    );
+    assert_eq!(code, Some(0));
+    let snap: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("d4.json")).unwrap()).unwrap();
+    assert_eq!(snap["fingerprint_depth"], 4);
+
+    let (_, stderr, _) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--baseline", "d4.json", "--diff-mode", "new",
+            "--on-baseline-mismatch", "warn",
+            "--format", "json", "--fail-on", "off",
+        ],
+    );
+    assert!(
+        stderr.contains("fingerprint depth changed (4 → 3)"),
+        "depth mismatch must be surfaced: {stderr}"
+    );
+}

@@ -88,6 +88,8 @@ pub struct Scanner<'a> {
     path_root: Option<std::path::PathBuf>,
     /// Content-addressed findings cache. `None` disables caching.
     cache: Option<&'a crate::cache::Cache>,
+    /// Ancestor depth folded into structural paths (fingerprint tuning).
+    fp_depth: usize,
 }
 
 impl<'a> Scanner<'a> {
@@ -100,7 +102,16 @@ impl<'a> Scanner<'a> {
             warnings: RefCell::new(Vec::new()),
             path_root: None,
             cache: None,
+            fp_depth: fingerprint::DEFAULT_ANCESTOR_DEPTH,
         }
+    }
+
+    /// Tune the fingerprint's structural-path ancestor depth. Changing this
+    /// changes finding identity: snapshots record it and the cache keys on
+    /// it, so mixed-depth comparisons are surfaced, never silent.
+    pub fn with_fingerprint_depth(mut self, depth: usize) -> Self {
+        self.fp_depth = depth;
+        self
     }
 
     /// Relativize finding paths against `root` (see the field docs). The root
@@ -288,7 +299,7 @@ impl<'a> Scanner<'a> {
         let start = node.start_position();
         let end = node.end_position();
         let normalized = fingerprint::normalized_match_text(source, node);
-        let structural = fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
+        let structural = fingerprint::structural_path(node, self.fp_depth);
         let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
         Finding {
             rule_id: rule.id.clone(),

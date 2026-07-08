@@ -137,6 +137,18 @@ path-independent `content_key`, so a renamed-but-unchanged finding's
 fingerprint is *recomposed* under the new path instead of decaying into
 fixed-old + new.
 
+**Suppressions:** the baseline's `suppressions` array (triaged/accepted
+fingerprints) is honored — listed findings disappear from every report and
+from the exit gate, but never from the emitted snapshot (the full set stays
+complete, and the list is carried forward so the next baseline keeps
+suppressing). Suppressions survive `partition`/`rescan-base`.
+
+**Fingerprint tuning:** `--fingerprint-depth <N>` (default 3) sets how many
+ancestor node kinds the structural path includes — stricter identity means
+fewer collisions but more churn on refactors. Depth is recorded in snapshots
+and checked by comparability, and it participates in cache keys, so a depth
+change can never silently mis-diff or serve stale entries.
+
 ### Incremental scanning (the findings cache)
 
 A file-local rule's findings are a pure function of `(path, file bytes,

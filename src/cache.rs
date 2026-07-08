@@ -36,20 +36,28 @@ pub struct Cache {
     /// per-file caching this must cover exactly the rules that run per file
     /// (in phase 4 terms: the file-local subset).
     ruleset_id: String,
+    /// Identity of the fingerprint scheme in effect (composition version +
+    /// tuning like ancestor depth / context lines); see
+    /// [`crate::fingerprint::scheme_id`].
+    scheme_id: String,
 }
 
 impl Cache {
     /// Open (creating if needed) a cache rooted at `dir`. The directory is
     /// made self-ignoring for git via a `.gitignore` containing `*`, and
     /// owner-only on Unix (see the module's trust-boundary note).
-    pub fn open(dir: PathBuf, ruleset_id: String) -> std::io::Result<Cache> {
+    pub fn open(dir: PathBuf, ruleset_id: String, scheme_id: String) -> std::io::Result<Cache> {
         create_dir_private(&dir)?;
         let ignore = dir.join(".gitignore");
         if !ignore.exists() {
             // Best-effort: a cache that can't self-ignore still works.
             let _ = std::fs::write(&ignore, "*\n");
         }
-        Ok(Cache { dir, ruleset_id })
+        Ok(Cache {
+            dir,
+            ruleset_id,
+            scheme_id,
+        })
     }
 
     /// The full opening policy in one place: `no_cache` disables, an explicit
@@ -62,12 +70,13 @@ impl Cache {
         repo_root: Option<&Path>,
         scan_anchor: Option<&Path>,
         ruleset_cache_id: String,
+        scheme_id: String,
     ) -> Option<Cache> {
         if no_cache {
             return None;
         }
         let dir = resolve_dir(explicit, repo_root, scan_anchor);
-        match Cache::open(dir, ruleset_cache_id) {
+        match Cache::open(dir, ruleset_cache_id, scheme_id) {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("warning: cannot open findings cache ({e}); continuing without it");
@@ -89,12 +98,10 @@ impl Cache {
         fingerprint::sha256_parts(&[
             "crit.cache/v1",
             env!("CARGO_PKG_VERSION"),
-            // The fingerprint scheme's tuning constants participate directly,
-            // so changing them invalidates entries even without a version bump.
-            &fingerprint::scheme_id(
-                fingerprint::DEFAULT_ANCESTOR_DEPTH,
-                fingerprint::CONTEXT_LINES,
-            ),
+            // The fingerprint scheme in effect (composition version + runtime
+            // tuning) participates directly, so a depth change or constant
+            // change invalidates entries even without a version bump.
+            &self.scheme_id,
             &self.ruleset_id,
             identity_path,
             content_hash,
@@ -200,7 +207,7 @@ mod tests {
     fn temp_cache(tag: &str) -> Cache {
         let dir = std::env::temp_dir().join(format!("crit-cache-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        Cache::open(dir, "sha256:rs".into()).unwrap()
+        Cache::open(dir, "sha256:rs".into(), "fp/v2:d3:c2".into()).unwrap()
     }
 
     #[test]
@@ -222,12 +229,13 @@ mod tests {
         assert_ne!(base, cache.key("p", "c2", "l", "g"), "content");
         assert_ne!(base, cache.key("p", "c", "l2", "g"), "language");
         assert_ne!(base, cache.key("p", "c", "l", "g2"), "grammar");
-        let other_rules = Cache::open(
-            std::env::temp_dir().join(format!("crit-cache-test-keys2-{}", std::process::id())),
-            "sha256:other".into(),
-        )
-        .unwrap();
+        let dir2 =
+            std::env::temp_dir().join(format!("crit-cache-test-keys2-{}", std::process::id()));
+        let other_rules =
+            Cache::open(dir2.clone(), "sha256:other".into(), "fp/v2:d3:c2".into()).unwrap();
         assert_ne!(base, other_rules.key("p", "c", "l", "g"), "ruleset");
+        let other_scheme = Cache::open(dir2, "sha256:rs".into(), "fp/v2:d4:c2".into()).unwrap();
+        assert_ne!(base, other_scheme.key("p", "c", "l", "g"), "fingerprint scheme");
     }
 
     #[test]

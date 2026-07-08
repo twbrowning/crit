@@ -105,6 +105,12 @@ struct CommonArgs {
     #[arg(long, conflicts_with = "cache_dir")]
     no_cache: bool,
 
+    /// Fingerprint tuning: how many ancestor node kinds the structural path
+    /// includes. Higher = stricter identity (fewer collisions, more churn on
+    /// refactors). Changing it changes finding identity; snapshots record it.
+    #[arg(long, value_name = "N", default_value_t = crit::fingerprint::DEFAULT_ANCESTOR_DEPTH)]
+    fingerprint_depth: usize,
+
     /// Print non-fatal warnings (e.g. rules skipped for a grammar) to stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -326,16 +332,23 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
 
     // Findings cache: on by default (content-addressed keys make staleness
     // structurally impossible), disabled by --no-cache. Keyed by the *cache*
-    // ruleset identity, which also covers text copied into findings.
+    // ruleset identity, which also covers text copied into findings, and by
+    // the fingerprint scheme in effect (composition version + tuning).
+    let scheme_id = crit::fingerprint::scheme_id(
+        args.common.fingerprint_depth,
+        crit::fingerprint::CONTEXT_LINES,
+    );
     let cache = crit::cache::Cache::open_default(
         args.common.no_cache,
         args.common.cache_dir.as_deref(),
         git_ctx.as_ref().map(|c| c.root()),
         args.paths.first().map(|p| p.as_path()),
         snapshot::ruleset_cache_id(&rules),
+        scheme_id,
     );
 
-    let mut scanner = Scanner::new(registry, &rules);
+    let mut scanner =
+        Scanner::new(registry, &rules).with_fingerprint_depth(args.common.fingerprint_depth);
     if let Some(ctx) = &git_ctx {
         scanner = scanner.with_path_root(ctx.root().to_path_buf());
     }
@@ -376,9 +389,10 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
 
     // The complete HEAD snapshot — always the full set, never a diff subset.
     // vcs provenance costs two git subprocesses, so resolve it only when the
-    // snapshot is actually serialized.
+    // snapshot is actually serialized. Written to disk *after* diffing so a
+    // consumed baseline's suppressions can be carried forward.
     let wants_snapshot = args.common.emit_snapshot.is_some() || args.common.format == Format::Snapshot;
-    let head_snapshot = Snapshot::from_findings(
+    let mut head_snapshot = Snapshot::from_findings(
         &report.findings,
         ruleset_id.clone(),
         grammar_versions.clone(),
@@ -388,10 +402,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
             None
         },
     );
-    if let Some(path) = &args.common.emit_snapshot {
-        std::fs::write(path, head_snapshot.to_json())
-            .with_context(|| format!("writing snapshot {}", path.display()))?;
-    }
+    head_snapshot.fingerprint_depth = args.common.fingerprint_depth;
 
     // Resolve requested diff modes (default: the whole-tree `all` behaviour).
     let modes = parse_diff_modes(&args.diff_mode)?;
@@ -418,6 +429,28 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
     } else {
         None
     };
+
+    // Carry the consumed baseline's triaged fingerprints forward, then emit.
+    if let Some(o) = &outcome {
+        let mut carried: Vec<String> = o.suppressed.iter().cloned().collect();
+        carried.sort();
+        head_snapshot.suppressions = carried;
+        if args.common.verbose && !o.suppressed.is_empty() {
+            let n = o
+                .annotated
+                .iter()
+                .filter(|f| o.suppressed.contains(&f.fingerprint))
+                .count();
+            eprintln!(
+                "suppressions: {n} finding(s) hidden by the baseline's {} triaged fingerprint(s)",
+                o.suppressed.len()
+            );
+        }
+    }
+    if let Some(path) = &args.common.emit_snapshot {
+        std::fs::write(path, head_snapshot.to_json())
+            .with_context(|| format!("writing snapshot {}", path.display()))?;
+    }
 
     let rendered = render(args, &report, &rules, &head_snapshot, outcome.as_ref(), &modes);
 
@@ -505,7 +538,11 @@ fn run_diff(env: &DiffEnv, head: Vec<crit::finding::Finding>) -> Result<DiffOutc
             if let Some(spec) = &spec {
                 baseline.remap_renames(spec.renames());
             }
-            let mismatches = baseline.comparability(env.ruleset_id, env.grammar_versions);
+            let mismatches = baseline.comparability(
+                env.ruleset_id,
+                env.grammar_versions,
+                env.args.common.fingerprint_depth,
+            );
             if mismatches.is_empty() {
                 DiffOutcome::diff(head, &baseline)
             } else {
@@ -589,8 +626,13 @@ fn mismatched_diff(
                 // the old rules missed labelled new-due-to-ruleset.
                 Ok(DiffOutcome::diff_partitioned(head, baseline, &base_now))
             } else {
-                // rescan-base: the re-derived base simply replaces the stale one.
-                Ok(DiffOutcome::diff(head, &base_now))
+                // rescan-base: the re-derived base replaces the stale one, but
+                // the supplied baseline's triaged suppressions still apply.
+                let mut outcome = DiffOutcome::diff(head, &base_now);
+                outcome
+                    .suppressed
+                    .extend(baseline.suppressions.iter().cloned());
+                Ok(outcome)
             }
         }
     }
@@ -646,8 +688,9 @@ fn diff_spec(args: &ScanArgs, git_ctx: Option<&GitContext>) -> Result<Option<git
 /// line up with the HEAD scan's repo-relative ones.
 fn scan_base_tree(env: &DiffEnv, ctx: &GitContext, base_commit: &str) -> Result<Snapshot> {
     let tree = ctx.materialize(base_commit)?;
-    let mut scanner =
-        Scanner::new(env.registry, env.rules).with_path_root(tree.path().to_path_buf());
+    let mut scanner = Scanner::new(env.registry, env.rules)
+        .with_path_root(tree.path().to_path_buf())
+        .with_fingerprint_depth(env.args.common.fingerprint_depth);
     // The base scan shares the HEAD scan's cache: identity paths are
     // worktree-relative on both sides, so unchanged files hit the entries the
     // HEAD scan just wrote (and vice versa) — whole-tree completeness at
@@ -677,12 +720,14 @@ fn scan_base_tree(env: &DiffEnv, ctx: &GitContext, base_commit: &str) -> Result<
     scanner.cross_file_pass(&mut report)?;
     crit::finding::finalize(&mut report.findings);
 
-    Ok(Snapshot::from_findings(
+    let mut snap = Snapshot::from_findings(
         &report.findings,
         env.ruleset_id.to_string(),
         snapshot::grammar_versions(env.registry, &report.languages_seen),
         None,
-    ))
+    );
+    snap.fingerprint_depth = env.args.common.fingerprint_depth;
+    Ok(snap)
 }
 
 /// Render the report in the requested format, differential when diffing.
