@@ -1,7 +1,7 @@
 # Vendored grammar: InterSystems ObjectScript (tree-sitter)
 
 These are the **generated** tree-sitter parser sources for InterSystems
-ObjectScript, vendored so that `catseye` can compile the bundled grammars
+ObjectScript, vendored so that `crit` can compile the bundled grammars
 reproducibly without network access at build time.
 
 | Field         | Value                                                       |
@@ -15,9 +15,9 @@ reproducibly without network access at build time.
 ## The four language variants
 
 InterSystems ObjectScript is modelled by upstream as a layered family of
-grammars. `catseye` vendors and statically compiles all four:
+grammars. `crit` vendors and statically compiles all four:
 
-| Variant id (catseye)     | Exported C symbol                    | Purpose / typical files                          | External scanner |
+| Variant id (crit)     | Exported C symbol                    | Purpose / typical files                          | External scanner |
 |--------------------------|--------------------------------------|--------------------------------------------------|------------------|
 | `objectscript_expr`      | `tree_sitter_objectscript_expr`      | Expression grammar (the base of the family)      | no               |
 | `objectscript_core`      | `tree_sitter_objectscript_core`      | One or more lines/statements of ObjectScript     | yes              |

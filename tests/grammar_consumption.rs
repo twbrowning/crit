@@ -1,4 +1,4 @@
-//! Validates that catseye can *consume* the InterSystems ObjectScript
+//! Validates that crit can *consume* the InterSystems ObjectScript
 //! tree-sitter grammar — all four bundled variants. For each variant we load the
 //! `tree_sitter::Language`, parse a representative snippet, and assert the parse
 //! is healthy and contains the node kinds we expect. This is the "consumption of
@@ -51,7 +51,7 @@ const CASES: &[Case] = &[
 /// Every one of the four variants must be present in the bundled set.
 #[test]
 fn all_four_variants_are_bundled() {
-    let ids: HashSet<_> = catseye::bundled::all().into_iter().map(|l| l.id).collect();
+    let ids: HashSet<_> = crit::bundled::all().into_iter().map(|l| l.id).collect();
     for expected in [
         "objectscript_expr",
         "objectscript_core",
@@ -60,13 +60,17 @@ fn all_four_variants_are_bundled() {
     ] {
         assert!(ids.contains(expected), "missing bundled variant {expected}");
     }
-    assert_eq!(ids.len(), 4, "expected exactly the four ObjectScript variants");
+    assert_eq!(
+        ids.len(),
+        4,
+        "expected exactly the four ObjectScript variants"
+    );
 }
 
 #[test]
 fn every_variant_loads_and_parses() {
     for case in CASES {
-        let lang = catseye::bundled::all()
+        let lang = crit::bundled::all()
             .into_iter()
             .find(|l| l.id == case.id)
             .unwrap_or_else(|| panic!("variant {} not bundled", case.id))
@@ -107,13 +111,13 @@ fn every_variant_loads_and_parses() {
     }
 }
 
-/// The same query API catseye uses for rules must work against a bundled grammar.
+/// The same query API crit uses for rules must work against a bundled grammar.
 #[test]
 fn queries_run_against_bundled_grammar() {
     use streaming_iterator::StreamingIterator;
     use tree_sitter::{Query, QueryCursor};
 
-    let lang = catseye::bundled::all()
+    let lang = crit::bundled::all()
         .into_iter()
         .find(|l| l.id == "objectscript_routine")
         .unwrap()

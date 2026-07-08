@@ -1,4 +1,4 @@
-//! catseye — a tree-sitter-based, language-agnostic source security scanner.
+//! crit — a tree-sitter-based, language-agnostic source security scanner.
 //!
 //! The crate is organised as:
 //! * [`bundled`]   — grammars statically compiled into the binary (ObjectScript).

@@ -1,14 +1,14 @@
-//! catseye CLI.
+//! crit CLI.
 
 use anyhow::{bail, Context, Result};
-use catseye::diff::{DiffMode, DiffOutcome};
-use catseye::engine::{ScanReport, Scanner};
-use catseye::finding::Severity;
-use catseye::language::LanguageRegistry;
-use catseye::report::{self, Format};
-use catseye::rule::{self, Rule};
-use catseye::snapshot::{self, Snapshot};
 use clap::{Parser, Subcommand};
+use crit::diff::{DiffMode, DiffOutcome};
+use crit::engine::{ScanReport, Scanner};
+use crit::finding::Severity;
+use crit::language::LanguageRegistry;
+use crit::report::{self, Format};
+use crit::rule::{self, Rule};
+use crit::snapshot::{self, Snapshot};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,7 +40,7 @@ impl std::str::FromStr for MismatchPolicy {
 
 /// A tree-sitter-based, language-agnostic source security scanner.
 #[derive(Parser)]
-#[command(name = "catseye", version, about, long_about = None)]
+#[command(name = "crit", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -209,7 +209,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
 
     // Canonicalize: sort (a documented, load-bearing ordering), dedup, and
     // assign fingerprint occurrence indices.
-    catseye::finding::finalize(&mut report.findings);
+    crit::finding::finalize(&mut report.findings);
 
     // Identity of this scan, for snapshots and comparability.
     let ruleset_id = snapshot::ruleset_id(&rules);
@@ -229,9 +229,8 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
 
     // Resolve requested diff modes (default: the whole-tree `all` behaviour).
     let modes = parse_diff_modes(&args.diff_mode)?;
-    let wants_diff = args.baseline.is_some()
-        || args.fail_on_new
-        || modes.iter().any(|m| *m != DiffMode::All);
+    let wants_diff =
+        args.baseline.is_some() || args.fail_on_new || modes.iter().any(|m| *m != DiffMode::All);
 
     let outcome = if wants_diff {
         Some(run_diff(args, &report, &ruleset_id, &grammar_versions)?)
@@ -239,7 +238,14 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
         None
     };
 
-    let rendered = render(args, &report, &rules, &head_snapshot, outcome.as_ref(), &modes);
+    let rendered = render(
+        args,
+        &report,
+        &rules,
+        &head_snapshot,
+        outcome.as_ref(),
+        &modes,
+    );
 
     if let Some(out) = &args.output {
         std::fs::write(out, rendered).with_context(|| format!("writing {}", out.display()))?;
@@ -258,9 +264,7 @@ fn scan(registry: &LanguageRegistry, args: &ScanArgs) -> Result<ExitCode> {
                 .reported(&modes)
                 .iter()
                 .filter(|f| f.state.map(|s| s.present_at_head()).unwrap_or(true))
-                .filter(|f| {
-                    !args.fail_on_new || f.state == Some(catseye::finding::FindingState::New)
-                })
+                .filter(|f| !args.fail_on_new || f.state == Some(crit::finding::FindingState::New))
                 .any(|f| f.severity <= threshold),
             None => report.findings.iter().any(|f| f.severity <= threshold),
         };
@@ -395,7 +399,10 @@ fn scan_path(
     report: &mut ScanReport,
 ) -> Result<()> {
     if path.is_dir() {
-        for entry in walkdir::WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.file_type().is_file() {
                 scanner.scan_file(entry.path(), language, report)?;
             }
@@ -408,10 +415,15 @@ fn scan_path(
 
 fn list_languages(registry: &LanguageRegistry) {
     if registry.is_empty() {
-        println!("No languages available. (Built with --no-default-features and no --languages-config?)");
+        println!(
+            "No languages available. (Built with --no-default-features and no --languages-config?)"
+        );
         return;
     }
-    println!("{:<24} {:<8} {:<22} {}", "ID", "SOURCE", "EXTENSIONS", "DESCRIPTION");
+    println!(
+        "{:<24} {:<8} {:<22} {}",
+        "ID", "SOURCE", "EXTENSIONS", "DESCRIPTION"
+    );
     for e in registry.entries() {
         let exts = if e.extensions.is_empty() {
             "-".to_string()
@@ -437,7 +449,10 @@ fn list_rules(rules: &[Rule]) {
         println!("No rules loaded.");
         return;
     }
-    println!("{:<40} {:<9} {:<28} {}", "ID", "SEVERITY", "LANGUAGES", "FORMAT");
+    println!(
+        "{:<40} {:<9} {:<28} {}",
+        "ID", "SEVERITY", "LANGUAGES", "FORMAT"
+    );
     for r in rules {
         let langs = if r.languages.is_empty() {
             "*".to_string()

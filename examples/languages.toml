@@ -1,10 +1,10 @@
-# Example dynamic-language registry for catseye.
+# Example dynamic-language registry for crit.
 #
-# catseye bundles the four InterSystems ObjectScript variants, but it can scan
+# crit bundles the four InterSystems ObjectScript variants, but it can scan
 # *any* language whose tree-sitter grammar you compile into a shared library.
 # Point `--languages-config` at a file like this:
 #
-#   catseye --languages-config examples/languages.toml scan path/ --rules my-rules/
+#   crit --languages-config examples/languages.toml scan path/ --rules my-rules/
 #
 # Build a grammar's shared library from its generated sources, e.g.:
 #   gcc -shared -fPIC -O2 -I src -o libtree-sitter-json.so src/parser.c src/scanner.c

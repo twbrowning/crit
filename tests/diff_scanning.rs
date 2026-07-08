@@ -4,12 +4,12 @@
 
 #![cfg(feature = "bundled-objectscript")]
 
-use catseye::diff::{DiffMode, DiffOutcome};
-use catseye::engine::{ScanReport, Scanner};
-use catseye::finding::{self, Finding};
-use catseye::language::LanguageRegistry;
-use catseye::rule::{self, Rule};
-use catseye::snapshot::{self, Snapshot};
+use crit::diff::{DiffMode, DiffOutcome};
+use crit::engine::{ScanReport, Scanner};
+use crit::finding::{self, Finding};
+use crit::language::LanguageRegistry;
+use crit::rule::{self, Rule};
+use crit::snapshot::{self, Snapshot};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -191,7 +191,7 @@ fn tempdir() -> TempDir {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("catseye-diff-test-{}-{n}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("crit-diff-test-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&base).expect("create tempdir");
     TempDir(base)
 }

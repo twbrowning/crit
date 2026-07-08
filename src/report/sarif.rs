@@ -20,7 +20,10 @@ pub fn render_sarif(findings: &[Finding], rules: &[Rule]) -> String {
         }
         let idx = driver_rules.len();
         rule_index.insert(f.rule_id.as_str(), idx);
-        driver_rules.push(rule_descriptor(&f.rule_id, rule_by_id.get(f.rule_id.as_str()).copied()));
+        driver_rules.push(rule_descriptor(
+            &f.rule_id,
+            rule_by_id.get(f.rule_id.as_str()).copied(),
+        ));
     }
 
     let results: Vec<Value> = findings
@@ -70,8 +73,8 @@ pub fn render_sarif(findings: &[Finding], rules: &[Rule]) -> String {
         "runs": [{
             "tool": {
                 "driver": {
-                    "name": "catseye",
-                    "informationUri": "https://github.com/twbrowning/catseye",
+                    "name": "crit",
+                    "informationUri": "https://github.com/twbrowning/crit",
                     "version": env!("CARGO_PKG_VERSION"),
                     "rules": driver_rules
                 }
@@ -90,10 +93,7 @@ fn rule_descriptor(id: &str, rule: Option<&Rule>) -> Value {
         if let Some(name) = &r.name {
             obj.insert("name".into(), json!(name));
         }
-        obj.insert(
-            "shortDescription".into(),
-            json!({ "text": r.message }),
-        );
+        obj.insert("shortDescription".into(), json!({ "text": r.message }));
         if let Some(d) = &r.description {
             obj.insert("fullDescription".into(), json!({ "text": d }));
         }

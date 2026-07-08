@@ -5,10 +5,10 @@
 
 #![cfg(feature = "bundled-objectscript")]
 
-use catseye::engine::{ScanReport, Scanner};
-use catseye::finding::{Finding, Severity};
-use catseye::language::LanguageRegistry;
-use catseye::rule::{self, Rule};
+use crit::engine::{ScanReport, Scanner};
+use crit::finding::{Finding, Severity};
+use crit::language::LanguageRegistry;
+use crit::rule::{self, Rule};
 use std::path::{Path, PathBuf};
 
 fn load_example_rules() -> Vec<Rule> {
@@ -65,7 +65,11 @@ fn vulnerable_class_is_flagged() {
     let findings = scan("tests/fixtures/vulnerable/Sample.cls", &rules);
 
     // Raw-query rules.
-    assert!(contains(&findings, "os-sql-dynamic-concat", 11), "{:?}", ids_and_lines(&findings));
+    assert!(
+        contains(&findings, "os-sql-dynamic-concat", 11),
+        "{:?}",
+        ids_and_lines(&findings)
+    );
     assert!(contains(&findings, "os-sql-tainted-exec", 12));
     assert!(contains(&findings, "os-dynamic-exec-xecute", 14));
     assert!(contains(&findings, "os-command-execution-zf", 15));
@@ -94,9 +98,16 @@ fn vulnerable_routine_is_flagged() {
 #[test]
 fn clean_files_have_no_findings() {
     let rules = load_example_rules();
-    for f in ["tests/fixtures/clean/Clean.cls", "tests/fixtures/clean/clean.mac"] {
+    for f in [
+        "tests/fixtures/clean/Clean.cls",
+        "tests/fixtures/clean/clean.mac",
+    ] {
         let findings = scan(f, &rules);
-        assert!(findings.is_empty(), "{f} produced findings: {:?}", ids_and_lines(&findings));
+        assert!(
+            findings.is_empty(),
+            "{f} produced findings: {:?}",
+            ids_and_lines(&findings)
+        );
     }
 }
 
@@ -108,7 +119,9 @@ fn predicates_actually_filter() {
     let rules = load_example_rules();
     let findings = scan("tests/fixtures/clean/Clean.cls", &rules);
     assert!(
-        !findings.iter().any(|f| f.rule_id == "os-sql-dynamic-concat"),
+        !findings
+            .iter()
+            .any(|f| f.rule_id == "os-sql-dynamic-concat"),
         "benign string concatenation must not be flagged as dynamic SQL"
     );
 }

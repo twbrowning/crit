@@ -142,7 +142,7 @@ impl<'a> Scanner<'a> {
         let mut cursor = QueryCursor::new();
         let mut buf1: Vec<u8> = Vec::new();
         let mut buf2: Vec<u8> = Vec::new();
-        let debug = std::env::var_os("CATSEYE_DEBUG").is_some();
+        let debug = std::env::var_os("CRIT_DEBUG").is_some();
 
         for cr in compiled.iter() {
             let rule = &self.rules[cr.rule_idx];
@@ -163,7 +163,12 @@ impl<'a> Scanner<'a> {
                             )
                         })
                         .collect();
-                    eprintln!("[dbg] rule={} sat={} caps=[{}]", rule.id, sat, caps.join(", "));
+                    eprintln!(
+                        "[dbg] rule={} sat={} caps=[{}]",
+                        rule.id,
+                        sat,
+                        caps.join(", ")
+                    );
                 }
                 if !sat {
                     continue;

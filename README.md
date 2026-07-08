@@ -1,6 +1,6 @@
-# catseye
+# crit
 
-A tree-sitter-based, language-agnostic source **security scanner**. catseye
+A tree-sitter-based, language-agnostic source **security scanner**. crit
 parses code with a tree-sitter grammar and reports security issues described as
 **rules** — either raw tree-sitter queries or a structured YAML format that
 transpiles to a tree-sitter query.
@@ -21,7 +21,7 @@ four language variants compiled in:
 
 ## Why "consumes a tree-sitter"
 
-catseye does not hard-code any language. It resolves a `tree_sitter::Language`
+crit does not hard-code any language. It resolves a `tree_sitter::Language`
 two ways:
 
 1. **Bundled** — grammars statically compiled into the binary (the four
@@ -29,13 +29,13 @@ two ways:
    `--no-default-features`.
 2. **Dynamic** — any grammar compiled to a shared library (`.so`/`.dylib`/`.dll`)
    and registered in a TOML config, loaded at runtime with `dlopen`. This makes
-   the tool work for *any* language without recompiling catseye.
+   the tool work for *any* language without recompiling crit.
 
 ## Build & install
 
 ```sh
 cargo build --release
-# binary at target/release/catseye
+# binary at target/release/crit
 ```
 
 A C compiler is required (the vendored ObjectScript parsers are compiled by
@@ -46,21 +46,21 @@ build takes ~30s.
 
 ```sh
 # Scan a tree using the example rules; language auto-detected by extension.
-catseye scan src/ --rules rules/
+crit scan src/ --rules rules/
 
 # Force a language (e.g. for stdin-like or unmapped files).
-catseye scan Foo.cls --language objectscript_udl --rules rules/
+crit scan Foo.cls --language objectscript_udl --rules rules/
 
 # CI-friendly SARIF for GitHub code scanning.
-catseye scan src/ --rules rules/ --format sarif --output results.sarif
+crit scan src/ --rules rules/ --format sarif --output results.sarif
 
 # Inspect the parse tree while authoring rules.
-catseye dump-ast Foo.cls
-echo ' xecute x' | catseye dump-ast --language objectscript_routine
+crit dump-ast Foo.cls
+echo ' xecute x' | crit dump-ast --language objectscript_routine
 
 # Discover what's available.
-catseye list-languages
-catseye list-rules --rules rules/
+crit list-languages
+crit list-rules --rules rules/
 ```
 
 Exit codes: `0` clean (or below threshold), `1` a finding at/above `--fail-on`
@@ -71,7 +71,7 @@ Output formats: `human` (default, colorized), `sarif` (SARIF 2.1.0), `json`,
 
 ## Differential ("what changed") scanning
 
-catseye can surface only the issues a change *introduces*, rather than the whole
+crit can surface only the issues a change *introduces*, rather than the whole
 backlog — the PR-review use case. Correctness is defined at the level of
 **findings**, never lines:
 
@@ -86,16 +86,16 @@ traded for completeness.
 
 The one stateful concept is a **snapshot**: the complete, fingerprinted finding
 set of one scan, plus the provenance (`ruleset_id`, `engine_version`,
-`grammar_versions`) needed to know whether two snapshots are comparable. catseye
+`grammar_versions`) needed to know whether two snapshots are comparable. crit
 *emits* it and *consumes* it as a baseline — it never commits anything itself, so
 a PR run never edits PR contents.
 
 ```sh
 # On the base ref (e.g. in CI, keyed by base SHA), produce a baseline:
-catseye scan src/ --rules rules/ --emit-snapshot base.snapshot.json
+crit scan src/ --rules rules/ --emit-snapshot base.snapshot.json
 
 # On the PR, report only what's new and gate CI on new findings only:
-catseye scan src/ --rules rules/ \
+crit scan src/ --rules rules/ \
         --baseline base.snapshot.json \
         --diff-mode new --fail-on-new --fail-on error
 ```
@@ -189,7 +189,7 @@ pattern:
 `text` accepts `regex` / `eq` / `not_regex` / `not_eq`, compiled to
 `#match?` / `#eq?` / `#not-match?` / `#not-eq?`. Because tree-sitter queries have
 no descendant combinator, `children` are *direct* children — one level of YAML
-nesting per level of the syntax tree. Use `catseye dump-ast` to see the shape.
+nesting per level of the syntax tree. Use `crit dump-ast` to see the shape.
 
 A YAML file may hold a single rule, a top-level list, or `{ rules: [ ... ] }`.
 
@@ -215,7 +215,7 @@ covering both authoring formats:
 gcc -shared -fPIC -O2 -I src -o libtree-sitter-json.so src/parser.c
 
 # Register it and scan — same engine, same rule formats:
-catseye --languages-config examples/languages.toml \
+crit --languages-config examples/languages.toml \
         scan config.json --rules examples/json-rules/
 ```
 
@@ -265,5 +265,5 @@ examples/                    # dynamic-language config + JSON rule
 
 ## License
 
-catseye is MIT-licensed. The vendored ObjectScript grammar is MIT © InterSystems
+crit is MIT-licensed. The vendored ObjectScript grammar is MIT © InterSystems
 Corporation (see [`vendor/objectscript/LICENSE`](vendor/objectscript/LICENSE)).

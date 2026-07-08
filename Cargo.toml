@@ -1,14 +1,14 @@
 [package]
-name = "catseye"
+name = "crit"
 version = "0.1.0"
 edition = "2021"
 description = "A tree-sitter-based, language-agnostic source security scanner with first-class InterSystems ObjectScript support."
 license = "MIT"
-repository = "https://github.com/twbrowning/catseye"
+repository = "https://github.com/twbrowning/crit"
 readme = "README.md"
 keywords = ["tree-sitter", "security", "sast", "objectscript", "scanner"]
 categories = ["command-line-utilities", "development-tools"]
-default-run = "catseye"
+default-run = "crit"
 
 [features]
 # The bundled ObjectScript grammars are compiled in by default. Turn this off

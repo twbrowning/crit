@@ -150,9 +150,11 @@ mod tests {
 
     #[test]
     fn hex_is_lowercase_and_64_chars() {
-        let h = sha256_hex(b"catseye");
+        let h = sha256_hex(b"crit");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
