@@ -39,6 +39,10 @@ pub struct Vcs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotFinding {
     pub fingerprint: String,
+    /// Path-independent identity half; enables rename remapping. Optional in
+    /// old snapshots (empty = remapping unavailable for that finding).
+    #[serde(default)]
+    pub content_key: String,
     pub rule_id: String,
     pub severity: Severity,
     pub language: String,
@@ -53,6 +57,7 @@ impl SnapshotFinding {
     fn from_finding(f: &Finding) -> Self {
         Self {
             fingerprint: f.fingerprint.clone(),
+            content_key: f.content_key.clone(),
             rule_id: f.rule_id.clone(),
             severity: f.severity,
             language: f.language.clone(),
@@ -78,9 +83,12 @@ impl SnapshotFinding {
             end: self.end,
             snippet: String::new(),
             fingerprint: self.fingerprint.clone(),
+            content_key: self.content_key.clone(),
             context_hash: self.context_hash.clone(),
             occurrence: self.occurrence,
             state: None,
+            diff_relation: None,
+            new_cause: None,
         }
     }
 }
@@ -187,6 +195,35 @@ impl Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Remap `old → new` file renames (from `git diff -M`) onto this baseline:
+    /// each affected finding's path is rewritten and its fingerprint
+    /// *recomposed* from the stored `content_key` under the new path, so a
+    /// renamed-but-unchanged finding matches its HEAD counterpart instead of
+    /// reading as fixed-old + new. Findings from pre-`content_key` snapshots
+    /// are left untouched (returned count says how many were remapped).
+    pub fn remap_renames(&mut self, renames: &[(String, String)]) -> usize {
+        use std::collections::HashMap;
+        let map: HashMap<&str, &str> = renames
+            .iter()
+            .map(|(o, n)| (o.as_str(), n.as_str()))
+            .collect();
+        let mut remapped = 0;
+        for f in &mut self.findings {
+            let key = f.file.to_string_lossy().replace('\\', "/");
+            if let Some(new_path) = map.get(key.as_str()) {
+                if f.content_key.is_empty() {
+                    continue; // old snapshot: cannot recompose safely
+                }
+                f.file = std::path::PathBuf::from(new_path);
+                f.fingerprint = fingerprint::compose(new_path, &f.content_key);
+                remapped += 1;
+            }
+        }
+        remapped
+    }
+}
+
 /// One reason a baseline is not identity-identical to the current scan.
 #[derive(Debug, Clone)]
 pub enum Mismatch {
@@ -267,9 +304,12 @@ mod tests {
             end: Position { line: 1, column: 2 },
             snippet: "x".into(),
             fingerprint: fp.into(),
+            content_key: format!("ck-{fp}"),
             context_hash: "c".into(),
             occurrence: occ,
             state: None,
+            diff_relation: None,
+            new_cause: None,
         }
     }
 

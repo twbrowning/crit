@@ -63,6 +63,23 @@ pub fn render_sarif(findings: &[Finding], rules: &[Rule]) -> String {
             if let Some(state) = f.state {
                 obj.insert("baselineState".into(), json!(state.sarif_baseline_state()));
             }
+            // Non-standard annotations ride in properties.
+            let props = obj
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+                .expect("properties object exists");
+            if let Some(rel) = f.diff_relation {
+                props.insert(
+                    "diffRelation".into(),
+                    serde_json::to_value(rel).expect("diff relation serializes"),
+                );
+            }
+            if let Some(cause) = f.new_cause {
+                props.insert(
+                    "newCause".into(),
+                    serde_json::to_value(cause).expect("new cause serializes"),
+                );
+            }
             result
         })
         .collect();

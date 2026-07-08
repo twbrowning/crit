@@ -1,7 +1,8 @@
 //! Human-readable, optionally colorized terminal output.
 
 use crate::diff::Counts;
-use crate::finding::{Finding, FindingState, Severity};
+use crate::finding::{Finding, FindingState, NewCause, Severity};
+use crate::git::DiffRelation;
 use owo_colors::{OwoColorize, Stream};
 
 fn severity_styled(sev: Severity) -> String {
@@ -35,6 +36,30 @@ fn render_finding(out: &mut String, f: &Finding) {
             .if_supports_color(Stream::Stdout, |t| t.dimmed().to_string()),
     ));
     out.push_str(&format!("  {}\n", f.message));
+
+    // Diff attribution: where this finding sits relative to the change's
+    // hunks. A new finding in an untouched file is the loud A→B case.
+    if let Some(rel) = f.diff_relation {
+        let tag = match rel {
+            DiffRelation::OnAddedLine => "on a line added by this change".to_string(),
+            DiffRelation::InChangedFileUnchangedLine => {
+                "in a changed file, on an untouched line".to_string()
+            }
+            DiffRelation::InUnchangedFile => {
+                let t = "in a file this change does not touch";
+                if f.state == Some(FindingState::New) {
+                    t.if_supports_color(Stream::Stdout, |x| x.bold().to_string())
+                        .to_string()
+                } else {
+                    t.to_string()
+                }
+            }
+        };
+        out.push_str(&format!(
+            "  {}\n",
+            format!("↳ {tag}").if_supports_color(Stream::Stdout, |t| t.dimmed().to_string())
+        ));
+    }
 
     if f.snippet.is_empty() {
         out.push('\n');
@@ -122,10 +147,20 @@ pub fn render_human_diff(
         findings
             .iter()
             .filter(|f| f.state.map(|s| want.contains(&s)).unwrap_or(false))
+            .filter(|f| f.new_cause != Some(NewCause::Ruleset))
             .collect()
     };
+    let ruleset_new: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.new_cause == Some(NewCause::Ruleset))
+        .collect();
 
     section(&mut out, "New in this change", &by(&[FindingState::New]));
+    section(
+        &mut out,
+        "Newly flagged by a rules/engine change (pre-existing code)",
+        &ruleset_new,
+    );
     section(
         &mut out,
         "Pre-existing",
@@ -138,8 +173,13 @@ pub fn render_human_diff(
             "No findings to report. Scanned {files_scanned} file(s), skipped {files_skipped}.\n"
         ));
     } else {
+        let ruleset_note = if ruleset_new.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} newly flagged by rules change)", ruleset_new.len())
+        };
         out.push_str(&format!(
-            "{} new, {} pre-existing, {} fixed  \
+            "{} new, {} pre-existing{ruleset_note}, {} fixed  \
              (scanned {files_scanned} file(s), skipped {files_skipped})\n",
             counts.new,
             counts.unchanged + counts.updated,

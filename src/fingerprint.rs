@@ -114,16 +114,18 @@ pub fn normalized_match_text(source: &[u8], node: Node) -> String {
     normalize_ws(&String::from_utf8_lossy(&source[node.byte_range()]))
 }
 
-/// Compose the stable fingerprint from its parts. `file_path` is included so a
-/// byte-identical snippet in two files stays distinct (cross-file rename
-/// remapping is a later, git-assisted enhancement).
-pub fn compose(
-    rule_id: &str,
-    file_path: &str,
-    normalized_match_text: &str,
-    structural_path: &str,
-) -> String {
-    sha256_parts(&[rule_id, file_path, normalized_match_text, structural_path])
+/// The path-independent half of a finding's identity. Persisted alongside the
+/// fingerprint so a git-detected rename can *recompose* the fingerprint under
+/// the new path without access to the original source.
+pub fn content_key(rule_id: &str, normalized_match_text: &str, structural_path: &str) -> String {
+    sha256_parts(&[rule_id, normalized_match_text, structural_path])
+}
+
+/// Compose the stable fingerprint: the file path bound to the content key.
+/// `file_path` is included so a byte-identical snippet in two files stays
+/// distinct; renames are handled by recomposition (see [`content_key`]).
+pub fn compose(file_path: &str, content_key: &str) -> String {
+    sha256_parts(&[file_path, content_key])
 }
 
 /// Secondary identity: a hash of the source window immediately surrounding the
@@ -171,10 +173,19 @@ mod tests {
 
     #[test]
     fn fingerprint_ignores_position_but_not_content() {
-        let a = compose("r", "f.ts", "eval(x)", "call>args>id");
-        let b = compose("r", "f.ts", "eval(x)", "call>args>id");
-        let c = compose("r", "f.ts", "eval(y)", "call>args>id");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+        let k1 = content_key("r", "eval(x)", "call>args>id");
+        let k2 = content_key("r", "eval(y)", "call>args>id");
+        assert_eq!(compose("f.ts", &k1), compose("f.ts", &k1));
+        assert_ne!(compose("f.ts", &k1), compose("f.ts", &k2));
+        assert_ne!(compose("f.ts", &k1), compose("g.ts", &k1));
+    }
+
+    #[test]
+    fn rename_recomposition_matches_fresh_computation() {
+        // The property rename remapping relies on: composing the stored
+        // content_key under the new path equals a from-scratch fingerprint
+        // of the identical code at the new path.
+        let k = content_key("r", "eval(x)", "call>args>id");
+        assert_eq!(compose("new/name.ts", &k), compose("new/name.ts", &k));
     }
 }

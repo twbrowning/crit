@@ -11,7 +11,8 @@
 //! git-assisted enhancement) is only a performance and reviewer-attribution
 //! signal; it never defines the max-security set.
 
-use crate::finding::{Finding, FindingState};
+use crate::finding::{Finding, FindingState, NewCause};
+use crate::git::DiffSpec;
 use crate::snapshot::Snapshot;
 use std::collections::{HashMap, HashSet};
 
@@ -124,6 +125,51 @@ impl DiffOutcome {
         Self { annotated: head }
     }
 
+    /// Partitioned diff, for a ruleset/engine mismatch with the base *source*
+    /// available: `base_now` is the base tree rescanned with the *current*
+    /// ruleset, `base_old` the supplied (old-ruleset) baseline.
+    ///
+    /// States are computed against `base_now` — the honest code-relative
+    /// numbers, so `new` means *new because the code changed*. Findings that
+    /// are pre-existing code-wise but absent from `base_old` (i.e. the old
+    /// rules didn't flag them) get `new_cause = ruleset`: surfaced by a rules/
+    /// engine bump, reported separately, and never tripping the new-code gate.
+    pub fn diff_partitioned(head: Vec<Finding>, base_old: &Snapshot, base_now: &Snapshot) -> Self {
+        let mut outcome = Self::diff(head, base_now);
+        let in_old: HashSet<(&str, usize)> = base_old
+            .findings
+            .iter()
+            .map(|b| (b.fingerprint.as_str(), b.occurrence))
+            .collect();
+        for f in &mut outcome.annotated {
+            match f.state {
+                Some(FindingState::New) => f.new_cause = Some(NewCause::Code),
+                Some(FindingState::Unchanged) | Some(FindingState::Updated) => {
+                    if !in_old.contains(&(f.fingerprint.as_str(), f.occurrence)) {
+                        f.new_cause = Some(NewCause::Ruleset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        outcome
+    }
+
+    /// Annotate every HEAD-present finding with its relationship to the
+    /// change's diff hunks. Reviewer signal only: a *new* finding
+    /// `in_unchanged_file` is the loud A→B case. Never filters anything.
+    pub fn attribute(&mut self, spec: &DiffSpec) {
+        for f in &mut self.annotated {
+            if f.state.map(|s| s.present_at_head()).unwrap_or(true) {
+                f.diff_relation = Some(spec.relation(
+                    &f.file.to_string_lossy().replace('\\', "/"),
+                    f.start.line,
+                    f.end.line,
+                ));
+            }
+        }
+    }
+
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
         for f in &self.annotated {
@@ -138,14 +184,20 @@ impl DiffOutcome {
         c
     }
 
-    /// The subset to report, given the requested modes (their union).
+    /// The subset to report, given the requested modes (their union). Under a
+    /// partitioned diff, `new` also admits ruleset-induced findings — they are
+    /// what the partition exists to surface (separately labelled, not gated).
     pub fn reported(&self, modes: &[DiffMode]) -> Vec<Finding> {
         self.annotated
             .iter()
             .filter(|f| {
-                f.state
+                let by_state = f
+                    .state
                     .map(|s| modes.iter().any(|m| m.admits(s)))
-                    .unwrap_or(true)
+                    .unwrap_or(true);
+                let by_cause = f.new_cause == Some(NewCause::Ruleset)
+                    && modes.contains(&DiffMode::New);
+                by_state || by_cause
             })
             .cloned()
             .collect()
@@ -186,9 +238,12 @@ mod tests {
             end: Position { line: 1, column: 2 },
             snippet: "x".into(),
             fingerprint: fp.into(),
+            content_key: format!("ck-{fp}"),
             context_hash: ctx.into(),
             occurrence: occ,
             state: None,
+            diff_relation: None,
+            new_cause: None,
         }
     }
 

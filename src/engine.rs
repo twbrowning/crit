@@ -44,6 +44,11 @@ pub struct Scanner<'a> {
     /// Non-fatal diagnostics (e.g. a rule's query that didn't compile for a
     /// particular language).
     warnings: RefCell<Vec<String>>,
+    /// When set, finding paths (and therefore fingerprints) are made relative
+    /// to this root. This is what lets a base-tree scan in a temp worktree and
+    /// a HEAD scan in the real checkout produce identical identities — and
+    /// makes snapshots portable across machines.
+    path_root: Option<std::path::PathBuf>,
 }
 
 impl<'a> Scanner<'a> {
@@ -53,7 +58,14 @@ impl<'a> Scanner<'a> {
             rules,
             compiled: RefCell::new(HashMap::new()),
             warnings: RefCell::new(Vec::new()),
+            path_root: None,
         }
+    }
+
+    /// Relativize finding paths against `root` (see the field docs).
+    pub fn with_path_root(mut self, root: std::path::PathBuf) -> Self {
+        self.path_root = Some(root);
+        self
     }
 
     pub fn take_warnings(&self) -> Vec<String> {
@@ -129,6 +141,14 @@ impl<'a> Scanner<'a> {
         let source = std::fs::read(path)
             .with_context(|| format!("reading source file {}", path.display()))?;
 
+        // The identity path: repo-relative when a root is set, as-given
+        // otherwise. Both the `file` field and the fingerprint use it.
+        let id_path = self
+            .path_root
+            .as_deref()
+            .and_then(|root| crate::git::relative_to(path, root))
+            .unwrap_or_else(|| path.to_path_buf());
+
         let mut parser = Parser::new();
         parser
             .set_language(entry.language())
@@ -191,12 +211,8 @@ impl<'a> Scanner<'a> {
                 let normalized = fingerprint::normalized_match_text(&source, node);
                 let structural =
                     fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
-                let fp = fingerprint::compose(
-                    &rule.id,
-                    &path.to_string_lossy(),
-                    &normalized,
-                    &structural,
-                );
+                let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
+                let fp = fingerprint::compose(&id_path.to_string_lossy(), &content_key);
                 let context_hash = fingerprint::context_hash(&source, node, CONTEXT_LINES);
 
                 report.findings.push(Finding {
@@ -204,7 +220,7 @@ impl<'a> Scanner<'a> {
                     message: rule.message.clone(),
                     severity: rule.severity,
                     language: entry.id.clone(),
-                    file: path.to_path_buf(),
+                    file: id_path.clone(),
                     start: Position {
                         line: start.row + 1,
                         column: start.column + 1,
@@ -215,9 +231,12 @@ impl<'a> Scanner<'a> {
                     },
                     snippet,
                     fingerprint: fp,
+                    content_key,
                     context_hash,
                     occurrence: 0,
                     state: None,
+                    diff_relation: None,
+                    new_cause: None,
                 });
             }
         }

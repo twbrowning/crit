@@ -91,13 +91,14 @@ set of one scan, plus the provenance (`ruleset_id`, `engine_version`,
 a PR run never edits PR contents.
 
 ```sh
-# On the base ref (e.g. in CI, keyed by base SHA), produce a baseline:
-crit scan src/ --rules rules/ --emit-snapshot base.snapshot.json
+# Zero setup, inside a git repo — scan the base ref itself for the baseline:
+crit diff src/ --base origin/main --rules rules/ --format sarif -o results.sarif
 
-# On the PR, report only what's new and gate CI on new findings only:
+# Or with a CI-cached baseline artifact (no extra base scan, no repo writes):
+crit scan src/ --rules rules/ --emit-snapshot base.snapshot.json     # on main
 crit scan src/ --rules rules/ \
-        --baseline base.snapshot.json \
-        --diff-mode new --fail-on-new --fail-on error
+        --baseline base.snapshot.json --diff-base origin/main \
+        --diff-mode new --fail-on-new --fail-on error                   # on the PR
 ```
 
 ### Flags (all additive; the default is today's whole-tree behaviour)
@@ -105,34 +106,52 @@ crit scan src/ --rules rules/ \
 | Flag | Meaning |
 |------|---------|
 | `--baseline <FILE>` | Prior snapshot to diff against. |
+| `--diff-base <REF>` | Git ref the change is against. Enables diff attribution + rename tracking; with no `--baseline`, crit scans the base ref itself (one extra full scan, zero setup). |
+| `--diff <FILE\|->` | Unified diff for attribution without git (VCS-agnostic escape hatch). |
 | `--diff-mode <all\|new\|fixed\|updated>` | What to report (repeatable; the union). `new` is the PR gate; `all` is the default. |
 | `--emit-snapshot <FILE>` | Always writes the **complete** HEAD finding set (seeds the next baseline), even under `--diff-mode new`. |
 | `--fail-on-new` | Gate the exit code on *new* findings only (nightly `--diff-mode all` jobs leave it off and fail on the full backlog). |
-| `--on-baseline-mismatch <fail\|warn\|partition\|rescan-base>` | What to do when the baseline's ruleset/engine/grammar identity differs from this scan. Default `warn`. |
+| `--on-baseline-mismatch <fail\|warn\|partition\|rescan-base>` | What to do when the baseline's ruleset/engine/grammar identity differs from this scan. Default `partition`. |
 
-Each finding carries a **state** (`new` / `unchanged` / `updated` / `absent`):
+The `crit diff` subcommand is sugar over these primitives: resolve base →
+obtain/derive the base snapshot (`--baseline-source scan|file:<p>|cache:<p>`) →
+full HEAD scan → set-difference → differential report → exit 1 on new ≥
+`--fail-on`.
 
-* **human** groups findings into *New in this change* / *Pre-existing* / *Fixed*;
+Each finding carries a **state** (`new` / `unchanged` / `updated` / `absent`),
+and — when `--diff-base`/`--diff` supplies hunks — a **`diff_relation`**
+(`on_added_line` / `in_changed_file_unchanged_line` / `in_unchanged_file`). The
+relation is a reviewer signal only, never a filter: a *new* finding
+`in_unchanged_file` is the loud case where a change in file A introduced an
+issue in untouched file B.
+
+* **human** groups findings into *New in this change* / *Newly flagged by a
+  rules change* / *Pre-existing* / *Fixed*, with attribution on each;
 * **SARIF** populates `result.baselineState` and `partialFingerprints`, so GitHub
   code scanning shows "new in this PR" natively — no git or artifact plumbing;
-* **JSON** adds `fingerprint`, `context_hash`, `occurrence`, and `state` per hit.
+* **JSON** adds `fingerprint`, `content_key`, `context_hash`, `occurrence`,
+  `state`, `diff_relation`, and `new_cause` per hit.
+
+File renames are tracked via `git diff -M`: each finding stores a
+path-independent `content_key`, so a renamed-but-unchanged finding's
+fingerprint is *recomposed* under the new path instead of decaying into
+fixed-old + new.
 
 ### Comparability
 
 "New since BASE" can mean the *code* changed **or** the *rules/grammar/engine*
 changed (an upgraded rule legitimately flags old code). The snapshot records
 `ruleset_id`, `engine_version`, and `grammar_versions`; on a mismatch,
-`--on-baseline-mismatch` decides. `fail` and `warn` need no base source;
-`partition`/`rescan-base` re-derive the base finding set with the *current* rules
-and require the base **source** (git integration — a later phase) — until then
-they degrade to `warn` with a note.
+`--on-baseline-mismatch` decides. `fail` and `warn` need no base source.
+`partition` (the default) and `rescan-base` re-derive the base finding set with
+the *current* rules by rescanning the base tree (needs `--diff-base` inside a
+git repo; otherwise they degrade to `warn` with a note):
 
-> **Scope note.** This is phase 1 of the design: fingerprints, snapshot
-> emit/consume, `--diff-mode`, and differential JSON/SARIF/human output, using a
-> CI-supplied baseline (the no-repo-write path). Git integration (`--diff-base`,
-> base-tree rescanning, per-line diff attribution) and the content-addressed
-> incremental cache are later phases; the machinery here is built to accept them
-> without a schema change.
+* **partition** reports the honest split — `new_cause: code` findings are truly
+  introduced by the change and gate CI; `new_cause: ruleset` findings are
+  pre-existing code newly flagged by a rules bump, reported separately and
+  never failing an innocent PR.
+* **rescan-base** simply replaces the stale baseline with the re-derived one.
 
 ## Writing rules
 

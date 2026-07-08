@@ -87,6 +87,16 @@ impl FindingState {
     }
 }
 
+/// Why a finding is being surfaced as new, under `--on-baseline-mismatch
+/// partition`: because the *code* changed, or because the *ruleset/engine*
+/// changed and now flags code that already existed at the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NewCause {
+    Code,
+    Ruleset,
+}
+
 /// A single security finding produced by matching a rule against a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -104,6 +114,10 @@ pub struct Finding {
     /// Stable, line-number-independent identity (see [`crate::fingerprint`]).
     #[serde(default)]
     pub fingerprint: String,
+    /// Path-independent half of the identity; lets a rename recompose the
+    /// fingerprint under the new path (see [`crate::fingerprint::content_key`]).
+    #[serde(default)]
+    pub content_key: String,
     /// Hash of the surrounding source window; distinguishes `unchanged` from
     /// `updated` when two findings share a `fingerprint`.
     #[serde(default)]
@@ -115,6 +129,14 @@ pub struct Finding {
     /// Relationship to the baseline, populated only when diffing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<FindingState>,
+    /// Relationship to the change's diff hunks (annotation, never a filter),
+    /// populated when `--diff-base`/`--diff` supplies hunk information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_relation: Option<crate::git::DiffRelation>,
+    /// Under `partition`: whether this newly-surfaced finding is due to a code
+    /// change or a ruleset/engine change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_cause: Option<NewCause>,
 }
 
 /// Canonicalize a scan's raw findings into the deterministic form the rest of

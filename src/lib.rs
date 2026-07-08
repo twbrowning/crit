@@ -10,6 +10,7 @@
 //! * [`fingerprint`] — stable, position-independent finding identity.
 //! * [`snapshot`]  — the persisted `crit.snapshot/v1` finding-set artifact.
 //! * [`diff`]      — differential ("what changed since a baseline") analysis.
+//! * [`git`]       — git integration: base refs, hunks, renames, base trees.
 //! * [`report`]    — output formats (human, SARIF, JSON).
 
 #[cfg(feature = "bundled-objectscript")]
@@ -20,6 +21,7 @@ pub mod diff;
 pub mod engine;
 pub mod finding;
 pub mod fingerprint;
+pub mod git;
 pub mod language;
 pub mod report;
 pub mod rule;
