@@ -114,6 +114,19 @@ pub fn normalized_match_text(source: &[u8], node: Node) -> String {
     normalize_ws(&String::from_utf8_lossy(&source[node.byte_range()]))
 }
 
+/// The canonical string form of a finding path for identity and diff-key
+/// purposes: forward slashes, no leading `./`. Every fingerprint composition
+/// and every join against git-produced paths MUST go through this one
+/// function — engine, rename remapping, and hunk attribution all agree on
+/// path shape only because they all call it.
+pub fn identity_path(path: &std::path::Path) -> String {
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    s
+}
+
 /// The path-independent half of a finding's identity. Persisted alongside the
 /// fingerprint so a git-detected rename can *recompose* the fingerprint under
 /// the new path without access to the original source.

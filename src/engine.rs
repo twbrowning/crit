@@ -62,9 +62,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Relativize finding paths against `root` (see the field docs).
+    /// Relativize finding paths against `root` (see the field docs). The root
+    /// is canonicalized once here so the per-file hot path doesn't redo it.
     pub fn with_path_root(mut self, root: std::path::PathBuf) -> Self {
-        self.path_root = Some(root);
+        self.path_root = Some(root.canonicalize().unwrap_or(root));
         self
     }
 
@@ -143,11 +144,25 @@ impl<'a> Scanner<'a> {
 
         // The identity path: repo-relative when a root is set, as-given
         // otherwise. Both the `file` field and the fingerprint use it.
-        let id_path = self
-            .path_root
-            .as_deref()
-            .and_then(|root| crate::git::relative_to(path, root))
-            .unwrap_or_else(|| path.to_path_buf());
+        let id_path = match self.path_root.as_deref() {
+            Some(root) => match crate::git::relative_to_canonical(path, root) {
+                Some(rel) => rel,
+                None => {
+                    // A file that escapes the root (symlink target, race)
+                    // keeps its as-given path — its identity then cannot
+                    // match a base-tree scan's, so say so rather than let a
+                    // permanent new+fixed pair appear silently.
+                    self.warnings.borrow_mut().push(format!(
+                        "{} lies outside the scan root {}; its findings keep a \
+                         non-portable path and may not diff cleanly",
+                        path.display(),
+                        root.display()
+                    ));
+                    path.to_path_buf()
+                }
+            },
+            None => path.to_path_buf(),
+        };
 
         let mut parser = Parser::new();
         parser
@@ -212,7 +227,7 @@ impl<'a> Scanner<'a> {
                 let structural =
                     fingerprint::structural_path(node, fingerprint::DEFAULT_ANCESTOR_DEPTH);
                 let content_key = fingerprint::content_key(&rule.id, &normalized, &structural);
-                let fp = fingerprint::compose(&id_path.to_string_lossy(), &content_key);
+                let fp = fingerprint::compose(&fingerprint::identity_path(&id_path), &content_key);
                 let context_hash = fingerprint::context_hash(&source, node, CONTEXT_LINES);
 
                 report.findings.push(Finding {

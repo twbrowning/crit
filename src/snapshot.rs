@@ -148,6 +148,22 @@ impl Snapshot {
                 SCHEMA
             );
         }
+        // A snapshot from the pre-content_key fingerprint scheme is
+        // *structurally* incomparable: no old fingerprint can ever match a
+        // new one, so any diff against it is 100% noise (everything new +
+        // everything fixed). Refuse loudly — this is the defined
+        // migration-or-rescan path — rather than let a degraded `warn` flow
+        // fail CI on the entire pre-existing backlog.
+        if !snap.findings.is_empty() && snap.findings.iter().all(|f| f.content_key.is_empty()) {
+            anyhow::bail!(
+                "baseline snapshot {} was produced by crit {} using an \
+                 incompatible fingerprint scheme; regenerate it with \
+                 --emit-snapshot, or pass --diff-base to derive one by \
+                 rescanning the base ref",
+                path.display(),
+                snap.engine_version,
+            );
+        }
         Ok(snap)
     }
 
@@ -210,7 +226,7 @@ impl Snapshot {
             .collect();
         let mut remapped = 0;
         for f in &mut self.findings {
-            let key = f.file.to_string_lossy().replace('\\', "/");
+            let key = fingerprint::identity_path(&f.file);
             if let Some(new_path) = map.get(key.as_str()) {
                 if f.content_key.is_empty() {
                     continue; // old snapshot: cannot recompose safely
@@ -218,6 +234,32 @@ impl Snapshot {
                 f.file = std::path::PathBuf::from(new_path);
                 f.fingerprint = fingerprint::compose(new_path, &f.content_key);
                 remapped += 1;
+            }
+        }
+        if remapped > 0 {
+            // Recomposition can merge findings from two files under one path
+            // (rename onto a deleted file's name), breaking the
+            // "(fingerprint, occurrence) unique within a snapshot" invariant
+            // that differencing relies on. Renumber occurrences in the same
+            // canonical order `finding::finalize` uses; groups that gained no
+            // duplicates renumber to their existing values.
+            let mut order: Vec<usize> = (0..self.findings.len()).collect();
+            order.sort_by(|&a, &b| {
+                let (fa, fb) = (&self.findings[a], &self.findings[b]);
+                fa.file
+                    .cmp(&fb.file)
+                    .then(fa.start.line.cmp(&fb.start.line))
+                    .then(fa.start.column.cmp(&fb.start.column))
+                    .then(fa.end.line.cmp(&fb.end.line))
+                    .then(fa.end.column.cmp(&fb.end.column))
+                    .then(fa.rule_id.cmp(&fb.rule_id))
+            });
+            let mut occ: HashMap<String, usize> = HashMap::new();
+            for i in order {
+                let f = &mut self.findings[i];
+                let n = occ.entry(f.fingerprint.clone()).or_insert(0);
+                f.occurrence = *n;
+                *n += 1;
             }
         }
         remapped

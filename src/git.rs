@@ -84,8 +84,10 @@ impl GitContext {
 
     /// Resolve `base` to the merge-base with HEAD (three-dot semantics): the
     /// commit a PR actually diverged from, not wherever the base branch has
-    /// moved since.
+    /// moved since. Everything base-relative — the hunk spec AND the
+    /// materialized base tree — must use this same commit.
     pub fn merge_base(&self, base: &str) -> Result<String> {
+        validate_ref(base)?;
         Ok(self.git(&["merge-base", base, "HEAD"])?.trim().to_string())
     }
 
@@ -94,13 +96,14 @@ impl GitContext {
     /// old→new rename mapping.
     pub fn diff_spec(&self, base: &str) -> Result<DiffSpec> {
         let merge_base = self.merge_base(base)?;
-        let text = self.git(&["diff", "-M", "--unified=0", &merge_base, "HEAD"])?;
+        let text = self.git(&["diff", "-M", "--unified=0", &merge_base, "HEAD", "--"])?;
         parse_unified_diff(&text)
     }
 
     /// Materialize the tree at `refname` into a detached temporary worktree.
     /// The returned guard removes the worktree on drop.
     pub fn materialize(&self, refname: &str) -> Result<BaseTree> {
+        validate_ref(refname)?;
         let dest = std::env::temp_dir().join(format!(
             "crit-base-{}-{}",
             std::process::id(),
@@ -123,6 +126,16 @@ impl GitContext {
             path: dest,
         })
     }
+}
+
+/// Reject ref values that git would parse as options ("--octopus", "-q", …):
+/// an empty-then-flag CI variable must fail loudly, not silently change what
+/// git computes.
+fn validate_ref(refname: &str) -> Result<()> {
+    if refname.is_empty() || refname.starts_with('-') {
+        bail!("invalid git ref '{refname}' (empty or looks like a flag)");
+    }
+    Ok(())
 }
 
 /// A materialized base tree (temporary detached worktree), removed on drop.
@@ -209,8 +222,15 @@ impl DiffSpec {
     }
 }
 
+/// Normalize a diff-sourced path string to the identity form (forward
+/// slashes, no leading `./`) — the string twin of
+/// [`crate::fingerprint::identity_path`].
 fn norm(path: &str) -> String {
-    path.replace('\\', "/")
+    let mut s = path.replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    s
 }
 
 /// Strip the conventional `a/` / `b/` prefix from a unified-diff path.
@@ -220,16 +240,41 @@ fn strip_ab(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Parse one `-l[,c]` / `+l[,c]` hunk-header segment into (start, count).
+fn parse_hunk_segment(seg: &str) -> Result<(usize, usize)> {
+    let body = &seg[1..];
+    Ok(match body.split_once(',') {
+        Some((s, c)) => (
+            s.parse::<usize>().context("hunk start")?,
+            c.parse::<usize>().context("hunk count")?,
+        ),
+        None => (body.parse::<usize>().context("hunk start")?, 1),
+    })
+}
+
 /// Parse a unified diff (as produced by `git diff` or any compliant tool) into
-/// a [`DiffSpec`]. Only headers are interpreted: `+++` for the post-image path,
+/// a [`DiffSpec`]. Headers interpreted: `+++` for the post-image path,
 /// `@@ -l,c +l,c @@` for added ranges, and git's `rename from`/`rename to`
 /// extended headers.
+///
+/// Hunk *bodies* are skipped by exact line count (the counts in the `@@`
+/// header), so content lines that happen to start with `+++ ` / `--- ` /
+/// `rename from ` can never be misread as headers.
 pub fn parse_unified_diff(text: &str) -> Result<DiffSpec> {
     let mut spec = DiffSpec::default();
     let mut current: Option<String> = None;
     let mut rename_from: Option<String> = None;
+    let mut body_remaining: usize = 0;
 
     for line in text.lines() {
+        if body_remaining > 0 {
+            // Inside a hunk body. `\ No newline at end of file` markers do not
+            // count toward the header's line totals.
+            if !line.starts_with('\\') {
+                body_remaining -= 1;
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("rename from ") {
             rename_from = Some(norm(rest.trim()));
         } else if let Some(rest) = line.strip_prefix("rename to ") {
@@ -247,19 +292,17 @@ pub fn parse_unified_diff(text: &str) -> Result<DiffSpec> {
             }
         } else if let Some(rest) = line.strip_prefix("@@") {
             // `@@ -l[,c] +l[,c] @@ ...`
-            let Some(file) = &current else { continue };
-            let plus = rest
-                .split_whitespace()
+            let mut segs = rest.split_whitespace();
+            let minus = segs
+                .find(|t| t.starts_with('-'))
+                .context("malformed hunk header (no '-' segment)")?;
+            let plus = segs
                 .find(|t| t.starts_with('+'))
                 .context("malformed hunk header (no '+' segment)")?;
-            let body = &plus[1..];
-            let (start, count) = match body.split_once(',') {
-                Some((s, c)) => (
-                    s.parse::<usize>().context("hunk start")?,
-                    c.parse::<usize>().context("hunk count")?,
-                ),
-                None => (body.parse::<usize>().context("hunk start")?, 1),
-            };
+            let (_, minus_count) = parse_hunk_segment(minus)?;
+            let (start, count) = parse_hunk_segment(plus)?;
+            body_remaining = minus_count + count;
+            let Some(file) = &current else { continue };
             if count > 0 {
                 spec.changed
                     .get_mut(file)
@@ -275,12 +318,15 @@ pub fn parse_unified_diff(text: &str) -> Result<DiffSpec> {
 /// sides so `./src/x`, absolute paths, and symlinked roots all normalize the
 /// same way. Returns `None` when `path` lies outside `root`.
 pub fn relative_to(path: &Path, root: &Path) -> Option<PathBuf> {
-    let canon_path = path.canonicalize().ok()?;
     let canon_root = root.canonicalize().ok()?;
-    canon_path
-        .strip_prefix(&canon_root)
-        .ok()
-        .map(|p| p.to_path_buf())
+    relative_to_canonical(path, &canon_root)
+}
+
+/// [`relative_to`] against an *already canonicalized* root — the per-file hot
+/// path, so the root's O(depth) resolution isn't redone for every file.
+pub fn relative_to_canonical(path: &Path, canon_root: &Path) -> Option<PathBuf> {
+    let canon_path = path.canonicalize().ok()?;
+    canon_path.strip_prefix(canon_root).ok().map(|p| p.to_path_buf())
 }
 
 #[cfg(test)]
@@ -355,5 +401,43 @@ deleted file mode 100644
         let spec = parse_unified_diff(PATCH).unwrap();
         // Finding spans lines 2-4; added range is 4-5 → overlap.
         assert_eq!(spec.relation("src/kept.mac", 2, 4), DiffRelation::OnAddedLine);
+    }
+
+    #[test]
+    fn hunk_body_lines_are_never_headers() {
+        // Content lines that *look* like headers: an added line starting
+        // "++ " renders as "+++ …", a removed line starting "-- " renders as
+        // "--- …". The count-based body skip must not misparse them.
+        let patch = "\
+--- a/src/a.mac
++++ b/src/a.mac
+@@ -1,2 +1,3 @@
+-old
+--- x
++++ i
++more
++z
+@@ -9,0 +10 @@
++tail
+";
+        let spec = parse_unified_diff(patch).unwrap();
+        assert_eq!(spec.relation("src/a.mac", 10, 10), DiffRelation::OnAddedLine);
+        // The bogus path "i" (from "+++ i") must not have been registered.
+        assert_eq!(spec.relation("i", 1, 1), DiffRelation::InUnchangedFile);
+        assert_eq!(spec.relation("src/a.mac", 1, 3), DiffRelation::OnAddedLine);
+    }
+
+    #[test]
+    fn flag_like_refs_are_rejected() {
+        assert!(validate_ref("--octopus").is_err());
+        assert!(validate_ref("-q").is_err());
+        assert!(validate_ref("").is_err());
+        assert!(validate_ref("origin/main").is_ok());
+    }
+
+    #[test]
+    fn norm_strips_dot_slash_and_backslashes() {
+        assert_eq!(norm("./src/a.mac"), "src/a.mac");
+        assert_eq!(norm("src\\a.mac"), "src/a.mac");
     }
 }

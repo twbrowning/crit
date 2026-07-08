@@ -233,6 +233,143 @@ fn partition_separates_ruleset_from_code() {
         Some(0),
         "ruleset-induced findings must not trip --fail-on-new; stderr: {stderr}"
     );
+
+    // Same without --fail-on-new: ruleset-induced findings still never gate —
+    // that invariant belongs to the partition itself, not to the flag.
+    let (_, stderr2, code2) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--baseline", "base.snapshot.json",
+            "--diff-base", &base_sha,
+            "--on-baseline-mismatch", "partition",
+            "--diff-mode", "new",
+            "--format", "json", "--fail-on", "error",
+        ],
+    );
+    assert_eq!(
+        code2,
+        Some(0),
+        "ruleset-induced error must not gate even without --fail-on-new; {stderr2}"
+    );
+}
+
+/// The base branch advancing past the PR's fork point must not leak into the
+/// diff: "base" means the merge-base, not the branch tip.
+#[test]
+fn base_means_merge_base_not_tip() {
+    let dir = tempdir("mergebase");
+    let repo = dir.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/app.mac"), VULN_XECUTE).unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "A: fork point (has the xecute vuln)"]);
+    git(repo, &["branch", "feat"]);
+
+    // main advances: someone FIXES the vuln on main after the fork.
+    std::fs::write(repo.join("src/app.mac"), "Sample ; routine\n quit\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "B: fix on main"]);
+
+    // The PR branch (from A) adds an unrelated file; the old vuln is still there.
+    git(repo, &["checkout", "-q", "feat"]);
+    std::fs::write(repo.join("src/other.mac"), VULN_ZF).unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "PR: add other.mac"]);
+
+    let (stdout, stderr, _) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--diff-base", "main",
+            "--format", "json", "--fail-on", "off",
+        ],
+    );
+    let findings = parse_findings(&stdout);
+    let new: Vec<_> = findings.iter().filter(|f| f["state"] == "new").collect();
+    assert_eq!(new.len(), 1, "only the PR's own $ZF is new; stderr: {stderr}");
+    assert_eq!(new[0]["file"], "src/other.mac");
+
+    // The xecute vuln exists at the merge-base AND at HEAD: unchanged. Had the
+    // base been main's TIP (where it was fixed), it would read as new.
+    let xecute: Vec<_> = findings
+        .iter()
+        .filter(|f| f["rule_id"] == "os-dynamic-exec-xecute")
+        .collect();
+    assert_eq!(xecute.len(), 1, "{findings:?}");
+    assert_eq!(
+        xecute[0]["state"], "unchanged",
+        "a fix on main after the fork must not make the PR's pre-existing vuln 'new'"
+    );
+}
+
+/// `--diff <patch>` alone must engage the diff pipeline (attribution +
+/// loud all-new), not silently no-op.
+#[test]
+fn diff_patch_flag_alone_is_not_a_noop() {
+    let (dir, base_sha) = fixture_repo("patchflag");
+    let repo = dir.path();
+    let patch = git(repo, &["diff", "-M", "--unified=0", &base_sha, "HEAD"]);
+    std::fs::write(repo.join("pr.patch"), patch).unwrap();
+
+    let (stdout, stderr, _) = crit(
+        repo,
+        &[
+            "scan", "src", "--rules", &rules_dir(),
+            "--diff", "pr.patch",
+            "--format", "json", "--fail-on", "off",
+        ],
+    );
+    assert!(
+        stderr.contains("treating every finding as new"),
+        "no baseline: must be loudly all-new, not silent: {stderr}"
+    );
+    let findings = parse_findings(&stdout);
+    assert!(!findings.is_empty());
+    let attributed = findings.iter().filter(|f| f["diff_relation"].is_string()).count();
+    assert_eq!(
+        attributed,
+        findings.len(),
+        "every finding must carry diff attribution from the patch: {findings:?}"
+    );
+    // The genuinely added xecute sits on added lines.
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["diff_relation"] == "on_added_line"),
+        "{findings:?}"
+    );
+}
+
+/// A pre-content_key (v0.1) baseline is structurally incomparable and must be
+/// rejected with the migration hint, not diffed into 100% noise.
+#[test]
+fn old_scheme_baseline_is_rejected() {
+    let (dir, _) = fixture_repo("oldscheme");
+    let repo = dir.path();
+    let old = serde_json::json!({
+        "schema": "crit.snapshot/v1",
+        "engine_version": "0.1.0",
+        "ruleset_id": "sha256:whatever",
+        "grammar_versions": {},
+        "findings": [{
+            "fingerprint": "aaaa", "rule_id": "r", "severity": "error",
+            "language": "objectscript_routine", "file": "src/app.mac",
+            "start": {"line": 1, "column": 1}, "end": {"line": 1, "column": 2},
+            "context_hash": "cc", "occurrence": 0
+        }]
+    });
+    std::fs::write(repo.join("old.json"), old.to_string()).unwrap();
+    let (_, stderr, code) = crit(
+        repo,
+        &["scan", "src", "--rules", &rules_dir(), "--baseline", "old.json", "--diff-mode", "new"],
+    );
+    assert_eq!(code, Some(2), "must be a hard error: {stderr}");
+    assert!(
+        stderr.contains("incompatible fingerprint scheme"),
+        "must explain the migration path: {stderr}"
+    );
 }
 
 // --- tempdir helper (no external crates) ---

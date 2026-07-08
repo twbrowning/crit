@@ -162,7 +162,7 @@ impl DiffOutcome {
         for f in &mut self.annotated {
             if f.state.map(|s| s.present_at_head()).unwrap_or(true) {
                 f.diff_relation = Some(spec.relation(
-                    &f.file.to_string_lossy().replace('\\', "/"),
+                    &crate::fingerprint::identity_path(&f.file),
                     f.start.line,
                     f.end.line,
                 ));
